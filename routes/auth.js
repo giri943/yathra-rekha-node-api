@@ -3,13 +3,49 @@ const jwt = require('jsonwebtoken');
 const { OAuth2Client } = require('google-auth-library');
 const fetch = require('node-fetch');
 const User = require('../models/User');
+const authenticateToken = require('../middleware/auth');
 const router = express.Router();
 
 const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
-// Generate JWT token
+// Generate JWT token.
+// Long-lived by design: this is a single-owner business app used daily on one
+// personal device. A 7-day expiry logged the owner out every week with no
+// recovery path, which was the app's biggest usability failure.
+const TOKEN_LIFETIME = process.env.JWT_EXPIRES_IN || '365d';
+
 const generateToken = (userId) => {
-  return jwt.sign({ userId }, process.env.JWT_SECRET, { expiresIn: '7d' });
+  return jwt.sign({ userId }, process.env.JWT_SECRET, { expiresIn: TOKEN_LIFETIME });
+};
+
+// Verify a Google credential and return its payload, or null if invalid.
+// Shared by /google (sign-in) and /reset-password (proof of email ownership).
+const verifyGoogleCredential = async ({ idToken, accessToken }) => {
+  if (idToken) {
+    const ticket = await client.verifyIdToken({
+      idToken,
+      audience: process.env.GOOGLE_CLIENT_ID
+    });
+    return ticket.getPayload();
+  }
+
+  if (accessToken) {
+    const response = await fetch(
+      `https://www.googleapis.com/oauth2/v2/userinfo?access_token=${accessToken}`
+    );
+    if (!response.ok) {
+      throw new Error('Failed to get user info from Google');
+    }
+    const userInfo = await response.json();
+    return {
+      sub: userInfo.id,
+      email: userInfo.email,
+      name: userInfo.name,
+      picture: userInfo.picture
+    };
+  }
+
+  return null;
 };
 
 // Register with email and phone
@@ -92,46 +128,43 @@ router.post('/google', async (req, res) => {
   try {
     const { idToken, accessToken } = req.body;
 
-    let payload;
-    
-    if (idToken) {
-      // Mobile/Desktop flow with idToken
-      const ticket = await client.verifyIdToken({
-        idToken,
-        audience: process.env.GOOGLE_CLIENT_ID
-      });
-      payload = ticket.getPayload();
-    } else if (accessToken) {
-      // Web flow with accessToken - get user info from Google API
-      const response = await fetch(`https://www.googleapis.com/oauth2/v2/userinfo?access_token=${accessToken}`);
-      if (!response.ok) {
-        throw new Error('Failed to get user info from Google');
-      }
-      const userInfo = await response.json();
-      payload = {
-        sub: userInfo.id,
-        email: userInfo.email,
-        name: userInfo.name,
-        picture: userInfo.picture
-      };
-    } else {
+    const payload = await verifyGoogleCredential({ idToken, accessToken });
+    if (!payload) {
       return res.status(400).json({ message: 'Either idToken or accessToken is required' });
     }
 
     const { sub: googleId, email, name, picture } = payload;
+    const normalisedEmail = email?.toLowerCase();
 
-    // Find or create user
+    // Match on googleId first, then fall back to email.
+    //
+    // The email fallback matters: the owner can sign in with either Google or a
+    // password. Looking up by googleId alone created a SECOND account for the
+    // same person, so their trips would vanish depending on how they signed in.
+    // (In practice it failed outright, because `email` is a unique index.)
     let user = await User.findOne({ googleId });
-    
+
+    if (!user && normalisedEmail) {
+      user = await User.findOne({ email: normalisedEmail });
+
+      // Existing password account for this email: link Google to it so both
+      // sign-in methods reach the same data.
+      if (user) {
+        user.googleId = googleId;
+        if (picture && !user.avatar) user.avatar = picture;
+        await user.save();
+      }
+    }
+
     if (!user) {
       user = new User({
         name,
-        email,
+        email: normalisedEmail,
         phone: '', // Empty phone for Google users
         googleId,
         avatar: picture
       });
-      
+
       await user.save();
     }
 
@@ -154,51 +187,9 @@ router.post('/google', async (req, res) => {
   }
 });
 
-// Test Google Sign-In (for development)
-router.post('/google-test', async (req, res) => {
-  try {
-    const { email, name } = req.body;
-    
-    if (!email || !name) {
-      return res.status(400).json({ message: 'Email and name required' });
-    }
-
-    const googleId = 'test_' + email;
-    
-    // Find or create user
-    let user = await User.findOne({ googleId });
-    
-    if (!user) {
-      const username = email.split('@')[0] + '_' + Date.now();
-      
-      user = new User({
-        username,
-        name,
-        email,
-        googleId,
-        avatar: 'https://via.placeholder.com/150'
-      });
-      
-      await user.save();
-    }
-
-    // Generate token
-    const token = generateToken(user._id);
-
-    res.json({
-      token,
-      user: {
-        id: user._id,
-        username: user.username,
-        name: user.name,
-        email: user.email,
-        avatar: user.avatar
-      }
-    });
-  } catch (error) {
-    res.status(500).json({ message: error.message });
-  }
-});
+// NOTE: a `/google-test` endpoint was removed here. It issued a valid JWT for
+// any {email, name} with no verification whatsoever — a development shortcut
+// that was live in production. The app never called it.
 
 // Get current user (protected route)
 router.get('/me', async (req, res) => {
@@ -248,28 +239,82 @@ router.delete('/delete', async (req, res) => {
   }
 });
 
-// Reset password directly
+// Reset a forgotten password.
+//
+// SECURITY: this endpoint previously overwrote any user's password given only
+// their email or phone number — no proof of ownership at all. It now requires a
+// valid Google credential for the SAME email, which proves the caller controls
+// that Google account. This avoids needing a paid SMS/OTP provider.
 router.post('/reset-password', async (req, res) => {
   try {
-    const { emailOrPhone, newPassword } = req.body;
+    const { newPassword, idToken, accessToken } = req.body;
 
-    // Find user by email or phone
-    const user = await User.findOne({
-      $or: [
-        { email: emailOrPhone },
-        { phone: emailOrPhone }
-      ]
-    });
-    
-    if (!user) {
-      return res.status(404).json({ message: 'ഈ ഇമെയിൽ/ഫോൺ നമ്പർ കണ്ടെത്തിയില്ല' });
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({
+        message: 'പാസ്വേഡിൽ കുറഞ്ഞത് 6 അക്ഷരം വേണം'
+      });
     }
 
-    // Update password directly
+    let payload;
+    try {
+      payload = await verifyGoogleCredential({ idToken, accessToken });
+    } catch (error) {
+      payload = null;
+    }
+
+    if (!payload?.email) {
+      return res.status(401).json({
+        message: 'സ്ഥിരീകരിക്കാൻ കഴിഞ്ഞില്ല. Google വഴി തുടരുക.'
+      });
+    }
+
+    const user = await User.findOne({ email: payload.email.toLowerCase() });
+
+    if (!user) {
+      return res.status(404).json({ message: 'ഈ ഇമെയിൽ കണ്ടെത്തിയില്ല' });
+    }
+
+    // Keep the accounts linked so both sign-in methods stay in sync.
+    if (!user.googleId) user.googleId = payload.sub;
     user.password = newPassword;
     await user.save();
 
-    res.json({ message: 'പാസ്വേഡ് രീസെറ്റ് ചെയ്തു' });
+    res.json({ message: 'പാസ്വേഡ് മാറ്റി' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Set or change the password while signed in.
+// Lets a Google user add a password so they can use either sign-in method.
+router.post('/set-password', authenticateToken, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({
+        message: 'പാസ്വേഡിൽ കുറഞ്ഞത് 6 അക്ഷരം വേണം'
+      });
+    }
+
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ message: 'ഉപയോക്താവിനെ കണ്ടെത്തിയില്ല' });
+    }
+
+    // If a password already exists, the current one must be supplied.
+    // Accounts created via Google have none, so they can set one freely.
+    if (user.password) {
+      const isMatch = await user.comparePassword(currentPassword || '');
+      if (!isMatch) {
+        return res.status(401).json({ message: 'ഇപ്പോഴത്തെ പാസ്വേഡ് തെറ്റാണ്' });
+      }
+    }
+
+    user.password = newPassword;
+    await user.save();
+
+    res.json({ message: 'പാസ്വേഡ് സേവ് ചെയ്തു' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

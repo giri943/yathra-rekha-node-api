@@ -6,6 +6,175 @@ const Trip = require('../models/Trip');
 const Vehicle = require('../models/Vehicle');
 const authenticateToken = require('../middleware/auth');
 
+// Business dashboard: revenue, expense and profit for a given month, plus
+// today's figures and anything needing attention.
+//
+// Everything is computed here rather than in the app so the phone makes one
+// request instead of downloading every trip and summing them client-side.
+//
+// Revenue  = total of trip rates (what clients pay)
+// Expense  = total of driver salaries (the only cost the app currently records)
+// Profit   = revenue - expense
+router.get('/dashboard', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const now = new Date();
+
+    // Month is 1-12 in the query; JS Date months are 0-11.
+    const year = parseInt(req.query.year) || now.getFullYear();
+    const month = parseInt(req.query.month) || now.getMonth() + 1;
+
+    const monthStart = new Date(year, month - 1, 1, 0, 0, 0, 0);
+    const monthEnd = new Date(year, month, 0, 23, 59, 59, 999);
+
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+    const todayEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+
+    // Sums revenue/expense/profit over a date range, split by trip type.
+    const summarise = async (from, to) => {
+      const rows = await Trip.aggregate([
+        { $match: { userId, tripDate: { $gte: from, $lte: to } } },
+        {
+          $group: {
+            _id: '$tripType',
+            tripCount: { $sum: 1 },
+            revenue: { $sum: '$tripRate' },
+            driverSalary: { $sum: '$driverSalary' },
+            distance: { $sum: { $ifNull: ['$distance', 0] } }
+          }
+        }
+      ]);
+
+      const totals = {
+        tripCount: 0,
+        revenue: 0,
+        driverSalary: 0,
+        distance: 0,
+        contractTripCount: 0,
+        contractRevenue: 0,
+        savariTripCount: 0,
+        savariRevenue: 0
+      };
+
+      for (const row of rows) {
+        totals.tripCount += row.tripCount;
+        totals.revenue += row.revenue;
+        totals.driverSalary += row.driverSalary;
+        totals.distance += row.distance;
+
+        if (row._id === 'contract') {
+          totals.contractTripCount = row.tripCount;
+          totals.contractRevenue = row.revenue;
+        } else if (row._id === 'savari') {
+          totals.savariTripCount = row.tripCount;
+          totals.savariRevenue = row.revenue;
+        }
+      }
+
+      totals.profit = totals.revenue - totals.driverSalary;
+      return totals;
+    };
+
+    // Driver salary recorded but not yet handed over — money still owed.
+    const unpaidSalary = async (from, to) => {
+      const [row] = await Trip.aggregate([
+        {
+          $match: {
+            userId,
+            driverSalaryPaid: false,
+            tripDate: { $gte: from, $lte: to }
+          }
+        },
+        { $group: { _id: null, amount: { $sum: '$driverSalary' }, tripCount: { $sum: 1 } } }
+      ]);
+      return { amount: row?.amount || 0, tripCount: row?.tripCount || 0 };
+    };
+
+    // Per-vehicle breakdown so the owner can see which vehicle earns most.
+    const perVehicle = async (from, to) => {
+      const rows = await Trip.aggregate([
+        { $match: { userId, tripDate: { $gte: from, $lte: to } } },
+        {
+          $group: {
+            _id: '$vehicleId',
+            tripCount: { $sum: 1 },
+            revenue: { $sum: '$tripRate' },
+            driverSalary: { $sum: '$driverSalary' }
+          }
+        },
+        { $sort: { revenue: -1 } }
+      ]);
+
+      const vehicles = await Vehicle.find({ userId }).select('vehicleNumber model');
+      const byId = new Map(vehicles.map((v) => [v._id.toString(), v]));
+
+      return rows.map((row) => {
+        const vehicle = byId.get(row._id?.toString());
+        return {
+          vehicleId: row._id,
+          vehicleNumber: vehicle?.vehicleNumber || '—',
+          model: vehicle?.model || '',
+          tripCount: row.tripCount,
+          revenue: row.revenue,
+          expense: row.driverSalary,
+          profit: row.revenue - row.driverSalary
+        };
+      });
+    };
+
+    const [today, monthTotals, unpaid, vehicles, allVehicles] = await Promise.all([
+      summarise(todayStart, todayEnd),
+      summarise(monthStart, monthEnd),
+      unpaidSalary(new Date(0), monthEnd),
+      perVehicle(monthStart, monthEnd),
+      Vehicle.find({ userId }).select('vehicleNumber insuranceExpiry taxDate testDate pollutionDate')
+    ]);
+
+    // Documents already expired, or expiring within 30 days.
+    // Expired entries come first — they are the urgent ones.
+    const documentLabels = {
+      insuranceExpiry: 'ഇൻഷുറൻസ്',
+      taxDate: 'ടാക്സ്',
+      testDate: 'ടെസ്റ്റ്',
+      pollutionDate: 'പൊള്യൂഷൻ'
+    };
+
+    const expiringDocuments = [];
+    for (const vehicle of allVehicles) {
+      for (const [field, label] of Object.entries(documentLabels)) {
+        const date = vehicle[field];
+        if (!date) continue;
+
+        const daysLeft = Math.floor((new Date(date) - todayStart) / 86400000);
+        if (daysLeft <= 30) {
+          expiringDocuments.push({
+            vehicleId: vehicle._id,
+            vehicleNumber: vehicle.vehicleNumber,
+            documentType: label,
+            date,
+            daysLeft,
+            expired: daysLeft < 0
+          });
+        }
+      }
+    }
+    expiringDocuments.sort((a, b) => a.daysLeft - b.daysLeft);
+
+    res.json({
+      year,
+      month,
+      today,
+      summary: monthTotals,
+      unpaidDriverSalary: unpaid,
+      vehicles,
+      expiringDocuments
+    });
+  } catch (error) {
+    console.error('Dashboard error:', error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // Generate contract billing PDF
 router.get('/contract-billing/:contractId', authenticateToken, async (req, res) => {
   try {
