@@ -4,6 +4,7 @@ const PDFDocument = require('pdfkit');
 const Contract = require('../models/Contract');
 const Trip = require('../models/Trip');
 const Vehicle = require('../models/Vehicle');
+const Driver = require('../models/Driver');
 const authenticateToken = require('../middleware/auth');
 
 // Business dashboard: revenue, expense and profit for a given month, plus
@@ -76,18 +77,55 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
     };
 
     // Driver salary recorded but not yet handed over — money still owed.
+    //
+    // Broken down per driver as well as in total: "you owe Rs 1,125" is not
+    // actionable on its own, because the owner still has to work out who to
+    // pay and for which trips.
     const unpaidSalary = async (from, to) => {
-      const [row] = await Trip.aggregate([
-        {
-          $match: {
-            userId,
-            driverSalaryPaid: false,
-            tripDate: { $gte: from, $lte: to }
+      const match = {
+        userId,
+        driverSalaryPaid: false,
+        tripDate: { $gte: from, $lte: to }
+      };
+
+      const [byDriver, [totals]] = await Promise.all([
+        Trip.aggregate([
+          { $match: match },
+          {
+            $group: {
+              _id: '$driverName',
+              amount: { $sum: '$driverSalary' },
+              tripCount: { $sum: 1 },
+              oldestTripDate: { $min: '$tripDate' },
+              latestTripDate: { $max: '$tripDate' }
+            }
+          },
+          // Largest debt first: that is the one to settle.
+          { $sort: { amount: -1 } }
+        ]),
+        Trip.aggregate([
+          { $match: match },
+          {
+            $group: {
+              _id: null,
+              amount: { $sum: '$driverSalary' },
+              tripCount: { $sum: 1 }
+            }
           }
-        },
-        { $group: { _id: null, amount: { $sum: '$driverSalary' }, tripCount: { $sum: 1 } } }
+        ])
       ]);
-      return { amount: row?.amount || 0, tripCount: row?.tripCount || 0 };
+
+      return {
+        amount: totals?.amount || 0,
+        tripCount: totals?.tripCount || 0,
+        drivers: byDriver.map((row) => ({
+          driverName: row._id || '—',
+          amount: row.amount,
+          tripCount: row.tripCount,
+          oldestTripDate: row.oldestTripDate,
+          latestTripDate: row.latestTripDate
+        }))
+      };
     };
 
     // Per-vehicle breakdown so the owner can see which vehicle earns most.
@@ -122,13 +160,33 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
       });
     };
 
-    const [today, monthTotals, unpaid, vehicles, allVehicles] = await Promise.all([
-      summarise(todayStart, todayEnd),
-      summarise(monthStart, monthEnd),
-      unpaidSalary(new Date(0), monthEnd),
-      perVehicle(monthStart, monthEnd),
-      Vehicle.find({ userId }).select('vehicleNumber insuranceExpiry taxDate testDate pollutionDate')
-    ]);
+    // Previous month, so the summary can say whether things are up or down.
+    const previousStart = new Date(year, month - 2, 1, 0, 0, 0, 0);
+    const previousEnd = new Date(year, month - 1, 0, 23, 59, 59, 999);
+
+    const [today, monthTotals, previousTotals, unpaid, vehicles, allVehicles, drivers] =
+      await Promise.all([
+        summarise(todayStart, todayEnd),
+        summarise(monthStart, monthEnd),
+        summarise(previousStart, previousEnd),
+        unpaidSalary(new Date(0), monthEnd),
+        perVehicle(monthStart, monthEnd),
+        Vehicle.find({ userId }).select(
+          'vehicleNumber insuranceExpiry taxDate testDate pollutionDate'
+        ),
+        Driver.find({ userId }).select('name phone')
+      ]);
+
+    // Attach phone numbers so the owner can ring a driver straight from the
+    // amount owed. Trips store the driver's name rather than a reference, so
+    // this matches on name and simply omits the number when there is no match.
+    const phoneByName = new Map(
+      drivers.map((d) => [d.name.trim().toLowerCase(), d.phone])
+    );
+    unpaid.drivers = unpaid.drivers.map((entry) => ({
+      ...entry,
+      phone: phoneByName.get(entry.driverName.trim().toLowerCase()) || null
+    }));
 
     // Documents already expired, or expiring within 30 days.
     // Expired entries come first — they are the urgent ones.
@@ -165,6 +223,7 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
       month,
       today,
       summary: monthTotals,
+      previous: previousTotals,
       unpaidDriverSalary: unpaid,
       vehicles,
       expiringDocuments
