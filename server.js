@@ -53,6 +53,7 @@ app.use('/api/vehicles', require('./routes/vehicles'));
 app.use('/api/contracts', require('./routes/contracts'));
 app.use('/api/trips', require('./routes/trips'));
 app.use('/api/drivers', require('./routes/drivers'));
+app.use('/api/expenses', require('./routes/expenses'));
 app.use('/api/reports', require('./routes/reports'));
 
 app.get('/', (req, res) => {
