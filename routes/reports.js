@@ -1,6 +1,16 @@
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const router = express.Router();
 const PDFDocument = require('pdfkit');
+
+/// Gayathri (Swathanthra Malayalam Computing). Chosen because fontkit — which
+/// PDFKit uses for shaping — crashes on Noto Sans/Serif Malayalam, and
+/// Malayalam needs real glyph reordering, not just a glyph table.
+const MALAYALAM_FONT = path.join(__dirname, '..', 'assets', 'fonts', 'Gayathri-Regular.ttf');
+
+/// Any character in the Malayalam Unicode block.
+const MALAYALAM = /[ഀ-ൿ]/;
 const Contract = require('../models/Contract');
 const Trip = require('../models/Trip');
 const Vehicle = require('../models/Vehicle');
@@ -408,11 +418,48 @@ router.get('/contract-billing/:contractId', authenticateToken, async (req, res) 
 
     // Create PDF
     const doc = new PDFDocument({ margin: 50 });
-    
-    // Set response headers
+
+    // Malayalam needs an embedded font: PDFKit's built-in Helvetica has no
+    // Malayalam glyphs, so contract and client names written in Malayalam
+    // would come out blank. Registered once here and used for every string
+    // that can contain user-entered text.
+    let malayalamFont = null;
+    if (fs.existsSync(MALAYALAM_FONT)) {
+      doc.registerFont('malayalam', MALAYALAM_FONT);
+      malayalamFont = 'malayalam';
+    }
+
+    /// Picks the embedded font only when the text actually needs it, so the
+    /// English labels keep Helvetica's tighter metrics.
+    ///
+    /// Takes the same arguments as doc.text — both (text, options) and
+    /// (text, x, y, options) forms.
+    const write = (text, ...rest) => {
+      const value = String(text ?? '');
+      doc.font(malayalamFont && MALAYALAM.test(value) ? malayalamFont : 'Helvetica');
+      return doc.text(value, ...rest);
+    };
+
     res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename=contract-billing-${contract.contractName}-${Date.now()}.pdf`);
-    
+
+    // HTTP headers are ISO-8859-1 only. Interpolating a Malayalam contract
+    // name straight into Content-Disposition made Node throw ERR_INVALID_CHAR
+    // and the whole request 500 — so the filename is ASCII, with the real
+    // name carried in the RFC 5987 form that clients actually read.
+    const asciiName = contract.contractName
+      .replace(/[^\x20-\x7E]/g, '')
+      .replace(/["\\]/g, '')
+      .trim()
+      .slice(0, 40);
+    const fallbackName = `billing-${asciiName || 'contract'}-${Date.now()}.pdf`;
+    const unicodeName = `billing-${contract.contractName}-${Date.now()}.pdf`;
+
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${fallbackName}"; ` +
+        `filename*=UTF-8''${encodeURIComponent(unicodeName)}`
+    );
+
     doc.pipe(res);
 
     // Header
@@ -425,17 +472,19 @@ router.get('/contract-billing/:contractId', authenticateToken, async (req, res) 
     doc.fontSize(14).text('Contract Details:', { underline: true });
     doc.moveDown(0.5);
     doc.fontSize(11);
-    doc.text(`Contract Name: ${contract.contractName}`);
-    doc.text(`Contract Rate: Rs. ${contract.rate.toFixed(2)} per trip`);
-    doc.text(`Average Distance: ${contract.averageDistance.toFixed(1)} km`);
-    doc.text(`Vehicle: ${contract.vehicleId?.vehicleNumber || 'N/A'} - ${contract.vehicleId?.model || 'N/A'}`);
+    write(`Contract Name: ${contract.contractName}`);
+    write(`Contract Rate: Rs. ${contract.rate.toFixed(2)} per trip`);
+    write(`Average Distance: ${contract.averageDistance.toFixed(1)} km`);
+    write(`Vehicle: ${contract.vehicleId?.vehicleNumber || 'N/A'} - ${contract.vehicleId?.model || 'N/A'}`);
     if (contract.contactPhone) {
-      doc.text(`Contact: ${contract.contactPhone}`);
+      write(`Contact: ${contract.contactPhone}`);
     }
-    doc.text(`Contract Period: ${formatDate(contract.contractStartDate)} to ${formatDate(contract.contractEndDate)}`);
-    
+    // Contracts have no start date on the model, so this printed
+    // "NaN/NaN/NaN" on every bill. Only the end date is known.
+    write(`Contract Valid Until: ${formatDate(contract.contractEndDate)}`);
+
     if (startDate && endDate) {
-      doc.text(`Billing Period: ${formatDate(new Date(startDate))} to ${formatDate(new Date(endDate))}`);
+      write(`Billing Period: ${formatDate(new Date(startDate))} to ${formatDate(new Date(endDate))}`);
     }
     doc.moveDown(2);
 
@@ -485,12 +534,13 @@ router.get('/contract-billing/:contractId', authenticateToken, async (req, res) 
       }
 
       doc.fontSize(9);
-      doc.text(formatDate(trip.tripDate), col1, yPosition, { width: 60 });
-      doc.text(trip.vehicleId?.vehicleNumber || 'N/A', col2, yPosition, { width: 90 });
-      doc.text(trip.driverName, col3, yPosition, { width: 90 });
-      doc.text(`${(trip.distance || 0).toFixed(1)} km`, col4, yPosition, { width: 90 });
-      doc.text(`Rs. ${trip.tripRate.toFixed(2)}`, col5, yPosition, { width: 70 });
-      doc.text(trip.notes || '-', col6, yPosition, { width: 70 });
+      write(formatDate(trip.tripDate), col1, yPosition, { width: 60 });
+      write(trip.vehicleId?.vehicleNumber || 'N/A', col2, yPosition, { width: 90 });
+      // Driver names and notes are the fields most likely to be in Malayalam.
+      write(trip.driverName, col3, yPosition, { width: 90 });
+      write(`${(trip.distance || 0).toFixed(1)} km`, col4, yPosition, { width: 90 });
+      write(`Rs. ${trip.tripRate.toFixed(2)}`, col5, yPosition, { width: 70 });
+      write(trip.notes || '-', col6, yPosition, { width: 70 });
 
       yPosition += 20;
     });
