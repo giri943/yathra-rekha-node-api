@@ -49,6 +49,7 @@ app.get('/api/proxy-image', async (req, res) => {
 
 // Routes
 app.use('/api/auth', require('./routes/auth'));
+app.use('/api/vehicle-classifications', require('./routes/vehicleClassifications'));
 app.use('/api/vehicles', require('./routes/vehicles'));
 app.use('/api/contracts', require('./routes/contracts'));
 app.use('/api/trips', require('./routes/trips'));

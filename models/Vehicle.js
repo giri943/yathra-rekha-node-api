@@ -35,20 +35,27 @@ const vehicleSchema = new mongoose.Schema({
   },
   userId: {
     type: String,
-    required: true
-  },
-  fixedRateFor5Km: {
-    type: Number,
     required: true,
-    default: 0
+    index: true,
   },
-  perKmRate: {
-    type: Number,
+
+  /// Reference to system vehicle classification (Pickup, Jeep, etc).
+  /// Carries rates and operational costs.
+  classificationId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'VehicleClassification',
     required: true,
-    default: 0
-  }
+    index: true,
+  },
 }, {
-  timestamps: true
+  timestamps: true,
+});
+
+/// Automatically populate classification when querying vehicles.
+vehicleSchema.pre(/^find/, function() {
+  if (!this.getOptions().excludeClassification) {
+    this.populate('classificationId', 'type category operationalCostPerKm savariPricing');
+  }
 });
 
 module.exports = mongoose.model('Vehicle', vehicleSchema);

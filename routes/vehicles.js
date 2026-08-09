@@ -36,8 +36,21 @@ router.get('/', auth, async (req, res) => {
 // Add new vehicle
 router.post('/', auth, async (req, res) => {
   try {
-    const { vehicleNumber, model, manufacturer, insuranceExpiry, taxDate, testDate, pollutionDate } = req.body;
-    
+    const {
+      vehicleNumber,
+      model,
+      manufacturer,
+      insuranceExpiry,
+      taxDate,
+      testDate,
+      pollutionDate,
+      classificationId,
+    } = req.body;
+
+    if (!classificationId) {
+      return res.status(400).json({ message: 'classificationId is required' });
+    }
+
     const vehicle = new Vehicle({
       vehicleNumber,
       model,
@@ -46,10 +59,13 @@ router.post('/', auth, async (req, res) => {
       taxDate,
       testDate,
       pollutionDate,
-      userId: req.user.id
+      classificationId,
+      userId: req.user.id,
     });
 
     await vehicle.save();
+    // Populate classification before responding
+    await vehicle.populate('classificationId');
     res.status(201).json(vehicle);
   } catch (error) {
     res.status(400).json({ message: 'Error creating vehicle', error: error.message });
@@ -59,31 +75,31 @@ router.post('/', auth, async (req, res) => {
 // Update vehicle
 router.put('/:id', auth, async (req, res) => {
   try {
-    const { vehicleNumber, 
-      model, 
-      manufacturer, 
-      insuranceExpiry, 
-      taxDate, 
-      testDate, 
+    const {
+      vehicleNumber,
+      model,
+      manufacturer,
+      insuranceExpiry,
+      taxDate,
+      testDate,
       pollutionDate,
-      fixedRateFor5Km,
-      perKmRate
-     } = req.body;
-    
+      classificationId,
+    } = req.body;
+
     const vehicle = await Vehicle.findOneAndUpdate(
       { _id: req.params.id, userId: req.user.id },
-      { vehicleNumber, 
-        model, 
-        manufacturer, 
-        insuranceExpiry, 
-        taxDate, 
-        testDate, 
+      {
+        vehicleNumber,
+        model,
+        manufacturer,
+        insuranceExpiry,
+        taxDate,
+        testDate,
         pollutionDate,
-        fixedRateFor5Km,
-        perKmRate
+        classificationId,
       },
       { new: true }
-    );
+    ).populate('classificationId');
 
     if (!vehicle) {
       return res.status(404).json({ message: 'Vehicle not found' });
