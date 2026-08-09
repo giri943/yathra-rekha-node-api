@@ -19,6 +19,7 @@ router.get('/', authenticateToken, async (req, res) => {
       }
       grouped[c.category].push({
         id: c._id,
+        category: c.category,
         type: c.type,
         operationalCostPerKm: c.operationalCostPerKm,
         savariPricing: c.savariPricing,
