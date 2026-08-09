@@ -141,3 +141,7 @@ package-lock.json
 
 # misc files
 recipes.csv
+
+# Demo seeder run state: records the _ids a specific run created in a specific
+# database, against a real account. Machine-local, not shared history.
+scripts/seed-demo-ids.json
