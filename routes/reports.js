@@ -278,8 +278,19 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
     };
 
     // Previous month, so the summary can say whether things are up or down.
+    //
+    // While the month on screen is still running, compare like with like: the
+    // first N days of last month against the first N of this one. Measured
+    // against the whole of last month, every month looked like a collapse
+    // until its final week — "70% down" in red on the 7th, for an owner who
+    // reads that as bad news, not as arithmetic.
+    const isCurrentMonth =
+      year === now.getFullYear() && month === now.getMonth() + 1;
     const previousStart = new Date(year, month - 2, 1, 0, 0, 0, 0);
-    const previousEnd = new Date(year, month - 1, 0, 23, 59, 59, 999);
+    const previousMonthDays = new Date(year, month - 1, 0).getDate();
+    const previousEnd = isCurrentMonth
+      ? new Date(year, month - 2, Math.min(now.getDate(), previousMonthDays), 23, 59, 59, 999)
+      : new Date(year, month - 1, 0, 23, 59, 59, 999);
 
     const [
       today,
@@ -367,6 +378,8 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
       today: withExpenses(today, todayExpenses),
       summary: withExpenses(monthTotals, monthExpenses),
       previous: withExpenses(previousTotals, previousExpenses),
+      // Tells the app which comparison it is showing, so it can say so.
+      previousIsToDate: isCurrentMonth,
       unpaidDriverSalary: unpaid,
       clients,
       vehicles,

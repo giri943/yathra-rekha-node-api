@@ -39,16 +39,25 @@ router.get('/', auth, async (req, res) => {
       }
     }
     
+    // A contract stays usable through the whole of its last day. Its end date
+    // is stored as that day's midnight, so "after now" dropped it from the
+    // trip form on the very day the contracts screen still showed it active.
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
     // Execute all queries in parallel
     const [trips, total, contracts, vehicles, drivers] = await Promise.all([
       Trip.find(filter)
         .populate('contractId', 'contractName rate averageDistance')
         .populate('vehicleId', 'vehicleNumber model')
-        .sort({ createdAt: -1 })
+        // By the day the trip happened, not the day it was typed in: the app
+        // groups this list under day headings, and a trip entered a few days
+        // late used to land at the top, splitting its day into two groups.
+        .sort({ tripDate: -1, createdAt: -1 })
         .skip(offset)
         .limit(limit),
       Trip.countDocuments(filter),
-      Contract.find({ userId: req.user.id, contractEndDate: { $gt: new Date() } })
+      Contract.find({ userId: req.user.id, contractEndDate: { $gte: startOfToday } })
         .populate('vehicleId', 'vehicleNumber model')
         .sort({ createdAt: -1 }),
       Vehicle.find({ userId: req.user.id })
@@ -109,10 +118,47 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
+// Settle a driver's outstanding salary in one go.
+//
+// Matches on driverName because that is what trips store (there is no
+// driverId yet), and on the same window the dashboard's "owed" figure is
+// computed over, so exactly the trips the owner was shown get marked.
+router.post('/settle-salary', auth, async (req, res) => {
+  try {
+    const { driverName, until } = req.body;
+    if (!driverName || typeof driverName !== 'string') {
+      return res.status(400).json({ message: 'driverName is required' });
+    }
+
+    const filter = {
+      userId: req.user.id,
+      driverName,
+      driverSalaryPaid: false
+    };
+    if (until) {
+      const end = new Date(until);
+      if (Number.isNaN(end.getTime())) {
+        return res.status(400).json({ message: 'until is not a valid date' });
+      }
+      filter.tripDate = { $lte: end };
+    }
+
+    const result = await Trip.updateMany(filter, { $set: { driverSalaryPaid: true } });
+    res.json({ updated: result.modifiedCount });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // Update trip
 router.put('/:id', auth, async (req, res) => {
   try {
     const tripData = { ...req.body };
+    // Ownership is fixed at creation. Passing the body straight through let a
+    // request reassign a trip to another account by sending a userId.
+    delete tripData.userId;
+    delete tripData._id;
+    delete tripData.id;
     
     // Auto-calculate distance for all trips with km data
     if (tripData.startKm && tripData.endKm) {

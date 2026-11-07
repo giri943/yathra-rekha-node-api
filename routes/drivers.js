@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const Driver = require('../models/Driver');
+const Trip = require('../models/Trip');
 const auth = require('../middleware/auth');
 
 // Get all drivers
@@ -33,14 +34,28 @@ router.post('/', auth, async (req, res) => {
 router.put('/:id', auth, async (req, res) => {
   try {
     const { name, phone } = req.body;
+    const previous = await Driver.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!previous) {
+      return res.status(404).json({ message: 'Driver not found' });
+    }
+
     const driver = await Driver.findOneAndUpdate(
       { _id: req.params.id, userId: req.user.id },
       { name, phone },
-      { new: true }
+      { new: true, runValidators: true }
     );
-    if (!driver) {
-      return res.status(404).json({ message: 'Driver not found' });
+
+    // Trips record the driver by name, not by reference. Without carrying a
+    // rename through, every past trip kept the old spelling: the driver's
+    // history and unpaid salary split in two, and editing an old trip showed
+    // an empty driver picker. Stopgap until trips carry a driverId.
+    if (name && previous.name !== driver.name) {
+      await Trip.updateMany(
+        { userId: req.user.id, driverName: previous.name },
+        { $set: { driverName: driver.name } }
+      );
     }
+
     res.json(driver);
   } catch (error) {
     res.status(400).json({ message: error.message });
