@@ -136,8 +136,9 @@ dist
 .yarn/install-state.gz
 .pnp.*
 
-# npm package file
-package-lock.json
+# package-lock.json is committed on purpose: without it Render resolved
+# versions afresh (and reused stale cached ones), so the server ran packages
+# nobody had audited.
 
 # misc files
 recipes.csv
