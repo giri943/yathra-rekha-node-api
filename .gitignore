@@ -145,3 +145,6 @@ recipes.csv
 # Demo seeder run state: records the _ids a specific run created in a specific
 # database, against a real account. Machine-local, not shared history.
 scripts/seed-demo-ids.json
+
+# Migration backups: full copies of real documents, kept on the machine that ran them.
+scripts/backups/
