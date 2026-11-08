@@ -6,6 +6,36 @@ const Vehicle = require('../models/Vehicle');
 const Driver = require('../models/Driver');
 const auth = require('../middleware/auth');
 const { queryFrom, containsRegex, vehicleIdsMatching } = require('../utils/search');
+const { startOfBusinessToday } = require('../utils/clock');
+const { sameName } = require('../utils/names');
+
+const DRIVER_NOT_FOUND = 'ഈ ഡ്രൈവറെ കണ്ടെത്തിയില്ല. ഡ്രൈവറെ വീണ്ടും തിരഞ്ഞെടുക്കുക.';
+
+/**
+ * Sets driverId and driverName on [tripData] from whichever the app sent.
+ *
+ * With a driverId, the driver must be this user's, and the name is taken
+ * from the driver record so the two can never disagree. An older app sends
+ * only a name: it is matched to the one driver of that name, if there is one.
+ * Returns an error message, or null.
+ */
+async function resolveDriver(userId, tripData) {
+  if (tripData.driverId) {
+    const driver = await Driver.findOne({ _id: tripData.driverId, userId }).select('name').lean()
+      .catch(() => null); // A malformed id is "not found", not a 500.
+    if (!driver) return DRIVER_NOT_FOUND;
+    tripData.driverName = driver.name;
+    return null;
+  }
+
+  delete tripData.driverId; // null or '' from the app: leave it unset.
+  if (tripData.driverName) {
+    const drivers = await Driver.find({ userId }).select('name').lean();
+    const matches = drivers.filter((d) => sameName(d.name, tripData.driverName));
+    if (matches.length === 1) tripData.driverId = matches[0]._id;
+  }
+  return null;
+}
 
 // Get trips page data (trips + contracts + vehicles) in single call
 router.get('/', auth, async (req, res) => {
@@ -24,6 +54,9 @@ router.get('/', auth, async (req, res) => {
     }
     if (req.query.contractId) {
       filter.contractId = req.query.contractId;
+    }
+    if (req.query.driverId) {
+      filter.driverId = req.query.driverId;
     }
     if (req.query.salaryPaid) {
       filter.driverSalaryPaid = req.query.salaryPaid === 'true';
@@ -63,8 +96,7 @@ router.get('/', auth, async (req, res) => {
     // A contract stays usable through the whole of its last day. Its end date
     // is stored as that day's midnight, so "after now" dropped it from the
     // trip form on the very day the contracts screen still showed it active.
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
+    const startOfToday = startOfBusinessToday();
 
     // Execute all queries in parallel
     const [trips, total, contracts, vehicles, drivers] = await Promise.all([
@@ -124,6 +156,11 @@ router.post('/', auth, async (req, res) => {
       tripData.distance = tripData.endKm - tripData.startKm;
     }
 
+    const driverError = await resolveDriver(req.user.id, tripData);
+    if (driverError) {
+      return res.status(400).json({ message: driverError });
+    }
+
     const trip = new Trip(tripData);
     const savedTrip = await trip.save();
     
@@ -141,21 +178,21 @@ router.post('/', auth, async (req, res) => {
 
 // Settle a driver's outstanding salary in one go.
 //
-// Matches on driverName because that is what trips store (there is no
-// driverId yet), and on the same window the dashboard's "owed" figure is
-// computed over, so exactly the trips the owner was shown get marked.
+// By driverId. A name alone (an older app, or a debt made only of trips saved
+// before driver ids) matches by name, as it always did. Same window as the
+// dashboard's "owed" figure, so exactly the trips the owner was shown.
 router.post('/settle-salary', auth, async (req, res) => {
   try {
-    const { driverName, until } = req.body;
-    if (!driverName || typeof driverName !== 'string') {
-      return res.status(400).json({ message: 'driverName is required' });
+    const { driverId, driverName, until } = req.body;
+    const filter = { userId: req.user.id, driverSalaryPaid: false };
+    if (driverId) {
+      filter.driverId = driverId;
+    } else if (driverName && typeof driverName === 'string') {
+      filter.driverName = driverName;
+    } else {
+      return res.status(400).json({ message: 'driverId or driverName is required' });
     }
 
-    const filter = {
-      userId: req.user.id,
-      driverName,
-      driverSalaryPaid: false
-    };
     if (until) {
       const end = new Date(until);
       if (Number.isNaN(end.getTime())) {
@@ -180,6 +217,13 @@ router.put('/:id', auth, async (req, res) => {
     delete tripData.userId;
     delete tripData._id;
     delete tripData.id;
+
+    if ('driverId' in tripData || 'driverName' in tripData) {
+      const driverError = await resolveDriver(req.user.id, tripData);
+      if (driverError) {
+        return res.status(400).json({ message: driverError });
+      }
+    }
     
     // Auto-calculate distance for all trips with km data
     if (tripData.startKm && tripData.endKm) {
@@ -189,7 +233,8 @@ router.put('/:id', auth, async (req, res) => {
     const trip = await Trip.findOneAndUpdate(
       { _id: req.params.id, userId: req.user.id },
       tripData,
-      { new: true }
+      // Validators on, so an edit can't save a discount over 100%.
+      { new: true, runValidators: true }
     ).populate('contractId', 'contractName rate averageDistance')
      .populate('vehicleId', 'vehicleNumber model');
     

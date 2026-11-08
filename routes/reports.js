@@ -9,6 +9,8 @@ const Vehicle = require('../models/Vehicle');
 const Driver = require('../models/Driver');
 const Expense = require('../models/Expense');
 const authenticateToken = require('../middleware/auth');
+const { businessNow } = require('../utils/clock');
+const { normaliseName } = require('../utils/names');
 
 // Business dashboard: revenue, expense and profit for a given month, plus
 // today's figures and anything needing attention.
@@ -24,7 +26,7 @@ const authenticateToken = require('../middleware/auth');
 router.get('/dashboard', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
-    const now = new Date();
+    const now = businessNow();
 
     // Month is 1-12 in the query; JS Date months are 0-11.
     const year = parseInt(req.query.year) || now.getFullYear();
@@ -96,9 +98,15 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
       const [byDriver, [totals]] = await Promise.all([
         Trip.aggregate([
           { $match: match },
+          // Newest first, so $first below is the driver's current name.
+          { $sort: { tripDate: -1 } },
           {
             $group: {
-              _id: '$driverName',
+              // One row per driver. Trips saved before driver ids have none
+              // and group by name instead, as all trips used to.
+              _id: { $ifNull: ['$driverId', '$driverName'] },
+              driverId: { $first: '$driverId' },
+              driverName: { $first: '$driverName' },
               amount: { $sum: '$driverSalary' },
               tripCount: { $sum: 1 },
               oldestTripDate: { $min: '$tripDate' },
@@ -124,7 +132,8 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
         amount: totals?.amount || 0,
         tripCount: totals?.tripCount || 0,
         drivers: byDriver.map((row) => ({
-          driverName: row._id || '—',
+          driverId: row.driverId ? String(row.driverId) : null,
+          driverName: row.driverName || '—',
           amount: row.amount,
           tripCount: row.tripCount,
           oldestTripDate: row.oldestTripDate,
@@ -299,7 +308,8 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
       clients,
       vehicles,
       allVehicles,
-      drivers
+      drivers,
+      anyTrip
     ] = await Promise.all([
       summarise(todayStart, todayEnd),
       summarise(monthStart, monthEnd),
@@ -313,7 +323,8 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
       Vehicle.find({ userId }).select(
         'vehicleNumber insuranceExpiry taxDate testDate pollutionDate'
       ),
-      Driver.find({ userId }).select('name phone')
+      Driver.find({ userId }).select('name phone'),
+      Trip.exists({ userId })
     ]);
 
     // Fold standalone costs into each period so "profit" means revenue minus
@@ -328,14 +339,15 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
     });
 
     // Attach phone numbers so the owner can ring a driver straight from the
-    // amount owed. Trips store the driver's name rather than a reference, so
-    // this matches on name and simply omits the number when there is no match.
-    const phoneByName = new Map(
-      drivers.map((d) => [d.name.trim().toLowerCase(), d.phone])
-    );
+    // amount owed: by id, or by name for trips saved before driver ids. No
+    // number when the driver has since been deleted.
+    const phoneById = new Map(drivers.map((d) => [String(d._id), d.phone]));
+    const phoneByName = new Map(drivers.map((d) => [normaliseName(d.name), d.phone]));
     unpaid.drivers = unpaid.drivers.map((entry) => ({
       ...entry,
-      phone: phoneByName.get(entry.driverName.trim().toLowerCase()) || null
+      phone: (entry.driverId
+        ? phoneById.get(entry.driverId)
+        : phoneByName.get(normaliseName(entry.driverName))) || null
     }));
 
     // Documents already expired, or expiring within 30 days.
@@ -379,7 +391,14 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
       unpaidDriverSalary: unpaid,
       clients,
       vehicles,
-      expiringDocuments
+      expiringDocuments,
+      // How far a new account has got: the app shows "getting started" steps
+      // until there is a vehicle, a driver and a trip.
+      setup: {
+        vehicleCount: allVehicles.length,
+        driverCount: drivers.length,
+        hasTrips: Boolean(anyTrip)
+      }
     });
   } catch (error) {
     console.error('Dashboard error:', error);

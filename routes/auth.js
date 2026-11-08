@@ -3,6 +3,11 @@ const jwt = require('jsonwebtoken');
 const { OAuth2Client } = require('google-auth-library');
 const fetch = require('node-fetch');
 const User = require('../models/User');
+const Trip = require('../models/Trip');
+const Expense = require('../models/Expense');
+const Contract = require('../models/Contract');
+const Driver = require('../models/Driver');
+const Vehicle = require('../models/Vehicle');
 const authenticateToken = require('../middleware/auth');
 const attemptLimiter = require('../middleware/attemptLimiter');
 const router = express.Router();
@@ -261,24 +266,42 @@ router.get('/me', async (req, res) => {
 });
 
 // Delete account (protected route)
-router.delete('/delete', async (req, res) => {
+// Delete the account AND everything in it.
+//
+// It used to remove only the user document, leaving their vehicles, trips,
+// contracts, drivers and expenses behind with nobody able to see or remove
+// them. Play Store policy requires the data to go with the account.
+//
+// Children are deleted before the user, so a failure part-way leaves a user
+// who can sign in and try again, never orphaned records with no owner.
+router.delete('/delete', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
   try {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token) {
-      return res.status(401).json({ message: 'No token provided' });
+    const deleted = {};
+    for (const [name, Model] of [
+      ['trips', Trip],
+      ['expenses', Expense],
+      ['contracts', Contract],
+      ['drivers', Driver],
+      ['vehicles', Vehicle],
+    ]) {
+      const result = await Model.deleteMany({ userId });
+      deleted[name] = result.deletedCount;
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findByIdAndDelete(decoded.userId);
-    authenticateToken.forgetUser(decoded.userId);
-    
+    const user = await User.findByIdAndDelete(userId);
+    authenticateToken.forgetUser(userId);
     if (!user) {
-      return res.status(404).json({ message: 'User not found' });
+      return res.status(404).json({ message: 'അക്കൗണ്ട് കണ്ടെത്തിയില്ല' });
     }
 
-    res.json({ message: 'അക്കൗണ്ട് ഡിലീറ്റ് ചെയ്തു' });
+    console.log(`Account ${userId} deleted`, deleted);
+    res.json({ message: 'അക്കൗണ്ട് ഡിലീറ്റ് ചെയ്തു', deleted });
   } catch (error) {
-    res.status(401).json({ message: 'Invalid token' });
+    console.error('Account delete failed:', error);
+    res.status(500).json({
+      message: 'അക്കൗണ്ട് ഡിലീറ്റ് ചെയ്യാനായില്ല. വീണ്ടും ശ്രമിക്കുക.'
+    });
   }
 });
 

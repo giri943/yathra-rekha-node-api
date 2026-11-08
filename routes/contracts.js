@@ -3,6 +3,7 @@ const router = express.Router();
 const Contract = require('../models/Contract');
 const Vehicle = require('../models/Vehicle');
 const auth = require('../middleware/auth');
+const { businessNow } = require('../utils/clock');
 
 // Get contracts page data (contracts + vehicles) in single call
 router.get('/', auth, async (req, res) => {
@@ -17,14 +18,14 @@ router.get('/', auth, async (req, res) => {
     // Build query filter
     const filter = { userId: req.user.id };
     if (active) {
-      filter.contractEndDate = { $gt: new Date() };
+      filter.contractEndDate = { $gt: businessNow() };
     }
     if (vehicleId) {
       filter.vehicleId = vehicleId;
     }
     
     // Handle status filter
-    const now = new Date();
+    const now = businessNow();
     if (status === 'active') {
       filter.contractEndDate = { $gt: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000) };
     } else if (status === 'expiring') {

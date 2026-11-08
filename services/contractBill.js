@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { businessNow } = require('../utils/clock');
 
 /// Gayathri (Swathanthra Malayalam Computing). Chosen because fontkit — which
 /// PDFKit uses for shaping — crashes on Noto Sans/Serif Malayalam, and
@@ -233,7 +234,7 @@ function buildContractBill(doc, { contract, trips, owner, lang = 'en', startDate
     y = doc.page.margins.top;
   }
   doc.fillColor(INK).fontSize(12).text(L.thanks, left, y, { width, align: 'center' });
-  doc.fillColor(MUTED).fontSize(9).text(`${L.generated}: ${formatDate(new Date())}`, left, doc.y + 4, { width, align: 'center' });
+  doc.fillColor(MUTED).fontSize(9).text(`${L.generated}: ${formatDate(businessNow())}`, left, doc.y + 4, { width, align: 'center' });
 
   return { totalAmount, totalDistance, tripCount: trips.length };
 }

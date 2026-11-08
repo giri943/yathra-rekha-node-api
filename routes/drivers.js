@@ -7,16 +7,14 @@ const auth = require('../middleware/auth');
 const DUPLICATE_NAME =
   'ഈ പേരിൽ ഒരു ഡ്രൈവർ ഇതിനകം ഉണ്ട്. വേർതിരിച്ചറിയാൻ പേരിൽ എന്തെങ്കിലും ചേർക്കുക';
 
-const sameName = (a, b) =>
-  String(a ?? '').trim().replace(/\s+/g, ' ').toLowerCase() ===
-  String(b ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+const { sameName } = require('../utils/names');
+const { businessNow } = require('../utils/clock');
 
 /**
  * Whether another of this user's drivers already has [name].
  *
- * Trips record the driver by name alone, so two drivers with one name share
- * a single trip history and unpaid-salary total, and the trip form's picker
- * could not tell them apart (it crashed on a seeded second "Kesavan").
+ * Trips now carry a driverId, but lists, bills and the salary-owed card still
+ * show names: two drivers called "Kesavan" would be indistinguishable there.
  */
 async function nameTaken(userId, name, exceptId) {
   const drivers = await Driver.find({ userId }).select('name').lean();
@@ -70,23 +68,26 @@ router.put('/:id', auth, async (req, res) => {
       { new: true, runValidators: true }
     );
 
-    // Trips record the driver by name, not by reference. Without carrying a
-    // rename through, every past trip kept the old spelling: the driver's
-    // history and unpaid salary split in two, and editing an old trip showed
-    // an empty driver picker. Stopgap until trips carry a driverId.
-    //
-    // Skipped while another driver still has the old name: those trips can't
-    // be told apart, and moving all of them would take the other's history.
-    const nameShared = await Driver.exists({
-      userId: req.user.id,
-      _id: { $ne: previous._id },
-      name: previous.name,
-    });
-    if (name && previous.name !== driver.name && !nameShared) {
+    // Trips keep a copy of the driver's name for display; bring it up to date
+    // so lists and bills show the new spelling. Trips from before driver ids
+    // are matched by the old name, and claimed for this driver while at it,
+    // unless another driver still has that name and they can't be told apart.
+    if (name && previous.name !== driver.name) {
       await Trip.updateMany(
-        { userId: req.user.id, driverName: previous.name },
+        { userId: req.user.id, driverId: previous._id },
         { $set: { driverName: driver.name } }
       );
+      const nameShared = await Driver.exists({
+        userId: req.user.id,
+        _id: { $ne: previous._id },
+        name: previous.name,
+      });
+      if (!nameShared) {
+        await Trip.updateMany(
+          { userId: req.user.id, driverId: null, driverName: previous.name },
+          { $set: { driverName: driver.name, driverId: previous._id } }
+        );
+      }
     }
 
     res.json(driver);
@@ -95,7 +96,56 @@ router.put('/:id', auth, async (req, res) => {
   }
 });
 
+// One driver's totals, for their history screen. The trips themselves come
+// from GET /trips?driverId=, page by page.
+//
+// Counts trips with this driverId only: run backfill-trip-driver-ids.js once
+// so trips saved before driver ids are included.
+router.get('/:id/summary', auth, async (req, res) => {
+  try {
+    const driver = await Driver.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!driver) {
+      return res.status(404).json({ message: 'ഈ ഡ്രൈവറെ കണ്ടെത്തിയില്ല' });
+    }
+
+    const now = businessNow();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const totalsFor = (extra) => Trip.aggregate([
+      { $match: { userId: driver.userId, driverId: driver._id, ...extra } },
+      {
+        $group: {
+          _id: null,
+          tripCount: { $sum: 1 },
+          salary: { $sum: '$driverSalary' },
+          distance: { $sum: { $ifNull: ['$distance', 0] } },
+          firstTripDate: { $min: '$tripDate' },
+          lastTripDate: { $max: '$tripDate' },
+        },
+      },
+    ]).then(([row]) => ({
+      tripCount: row?.tripCount || 0,
+      salary: row?.salary || 0,
+      distance: row?.distance || 0,
+      firstTripDate: row?.firstTripDate || null,
+      lastTripDate: row?.lastTripDate || null,
+    }));
+
+    const [allTime, thisMonth, unpaid] = await Promise.all([
+      totalsFor({}),
+      totalsFor({ tripDate: { $gte: monthStart } }),
+      totalsFor({ driverSalaryPaid: false }),
+    ]);
+
+    res.json({ driver, allTime, thisMonth, unpaid });
+  } catch (error) {
+    res.status(500).json({ message: 'വിവരങ്ങൾ കിട്ടിയില്ല. വീണ്ടും ശ്രമിക്കുക.' });
+  }
+});
+
 // Delete driver
+//
+// Their trips stay, with their name and driverId: the money was paid and
+// earned. A new driver later given the same name gets a fresh history.
 router.delete('/:id', auth, async (req, res) => {
   try {
     const driver = await Driver.findOneAndDelete({ _id: req.params.id, userId: req.user.id });
