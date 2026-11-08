@@ -5,6 +5,7 @@ const Contract = require('../models/Contract');
 const Vehicle = require('../models/Vehicle');
 const Driver = require('../models/Driver');
 const auth = require('../middleware/auth');
+const { queryFrom, containsRegex, vehicleIdsMatching } = require('../utils/search');
 
 // Get trips page data (trips + contracts + vehicles) in single call
 router.get('/', auth, async (req, res) => {
@@ -37,6 +38,26 @@ router.get('/', auth, async (req, res) => {
         endDate.setHours(23, 59, 59, 999);
         filter.tripDate.$lte = endDate;
       }
+    }
+
+    // Free-text search: client, phone, driver, notes, vehicle number or
+    // contract name. The app sends no date range with it, so it spans every
+    // month — "when did I last drive Fathima?" has no month to pick.
+    const q = queryFrom(req);
+    if (q) {
+      const rx = containsRegex(q);
+      const [vehicleIds, contractIds] = await Promise.all([
+        vehicleIdsMatching(Vehicle, req.user.id, q),
+        Contract.distinct('_id', { userId: req.user.id, contractName: rx }),
+      ]);
+      filter.$or = [
+        { clientName: rx },
+        { clientMobile: rx },
+        { driverName: rx },
+        { notes: rx },
+        { vehicleId: { $in: vehicleIds } },
+        { contractId: { $in: contractIds } },
+      ];
     }
     
     // A contract stays usable through the whole of its last day. Its end date

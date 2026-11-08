@@ -18,6 +18,7 @@ const mongoose = require('mongoose');
 
 const User = require('../models/User');
 const Vehicle = require('../models/Vehicle');
+const VehicleClassification = require('../models/VehicleClassification');
 const Contract = require('../models/Contract');
 const Driver = require('../models/Driver');
 const Trip = require('../models/Trip');
@@ -40,10 +41,27 @@ const daysFromNow = (n) => {
   return d;
 };
 
-/** A date inside the month `monthsBack` before this one. */
+/**
+ * A date inside the month `monthsBack` before this one, never after today.
+ * In the running month the day is clamped to today: trips dated next week
+ * would inflate "this month" and break the month-to-date comparison.
+ */
 const inMonth = (monthsBack, dayOfMonth) => {
-  const d = new Date(today.getFullYear(), today.getMonth() - monthsBack, dayOfMonth, 12, 0, 0);
-  return d;
+  const daysInMonth = new Date(today.getFullYear(), today.getMonth() - monthsBack + 1, 0).getDate();
+  const lastDay = monthsBack === 0 ? today.getDate() : daysInMonth;
+  return new Date(
+    today.getFullYear(), today.getMonth() - monthsBack, Math.min(dayOfMonth, lastDay), 12, 0, 0
+  );
+};
+
+/**
+ * The day for item `i` of `count`, spread evenly over the days the month has
+ * had so far: the whole month for past months, up to today for this one.
+ */
+const spreadDay = (monthsBack, i, count) => {
+  const daysInMonth = new Date(today.getFullYear(), today.getMonth() - monthsBack + 1, 0).getDate();
+  const days = monthsBack === 0 ? today.getDate() : daysInMonth;
+  return 1 + Math.floor((i * days) / Math.max(count, 1));
 };
 
 const round = (n) => Math.round(n);
@@ -95,6 +113,7 @@ async function seed() {
     {
       vehicleNumber: 'KL 07 AZ 3312',
       model: 'Innova Crysta',
+      type: 'Car',
       manufacturer: 'Toyota',
       insuranceExpiry: daysFromNow(-18), // expired
       taxDate: daysFromNow(12), // due soon
@@ -106,6 +125,7 @@ async function seed() {
     {
       vehicleNumber: 'KL 07 BX 7788',
       model: 'Traveller 26S',
+      type: 'Bus',
       manufacturer: 'Force',
       insuranceExpiry: daysFromNow(140),
       taxDate: daysFromNow(24), // due soon
@@ -117,27 +137,42 @@ async function seed() {
     {
       vehicleNumber: 'KL 07 CD 1045',
       model: 'Eeco',
+      type: 'Van',
       manufacturer: 'Maruti',
       insuranceExpiry: daysFromNow(300),
       taxDate: daysFromNow(280),
       testDate: daysFromNow(190),
       pollutionDate: daysFromNow(160),
-      fixedRateFor5Km: 200,
-      perKmRate: 16
+      // No own rate: savari trips use the Van type's default.
     }
   ];
 
   const vehicles = [];
-  for (const spec of vehicleSpecs) {
-    // vehicleNumber is globally unique, so reuse an existing row rather than
+  /** vehicle _id → the rates a savari trip is priced at: his own, else the type's. */
+  const savariRates = new Map();
+  for (const { type, ...spec } of vehicleSpecs) {
+    // vehicleNumber is unique per user, so reuse an existing row rather than
     // failing the whole seed.
-    let vehicle = await Vehicle.findOne({ vehicleNumber: spec.vehicleNumber });
+    let vehicle = await Vehicle.findOne({
+      userId,
+      numberKey: Vehicle.toNumberKey(spec.vehicleNumber),
+    });
     if (vehicle) {
       console.log(`  vehicle ${spec.vehicleNumber} already exists — reusing`);
     } else {
-      vehicle = await Vehicle.create({ ...spec, userId });
+      const classification = await VehicleClassification.findOne({ type });
+      if (!classification) {
+        throw new Error(`No "${type}" classification — run scripts/seed-classifications.js first`);
+      }
+      vehicle = await Vehicle.create({ ...spec, classificationId: classification._id, userId });
       created.Vehicle.push(vehicle._id);
     }
+    const type = await VehicleClassification.findById(vehicle.classificationId);
+    savariRates.set(vehicle._id.toString(), {
+      fixed: vehicle.fixedRateFor5Km || type.savariPricing.fixedRateFor5Km,
+      perKm: vehicle.perKmRate || type.savariPricing.perKmRate,
+      runningCost: vehicle.operationalCostPerKm || type.operationalCostPerKm,
+    });
     vehicles.push(vehicle);
   }
   console.log(`Vehicles: ${vehicles.length}`);
@@ -217,7 +252,10 @@ async function seed() {
 
     // Contract trips.
     for (let i = 0; i < contractTrips; i++) {
-      const contract = contracts[i % contracts.length];
+      const tripDate = inMonth(monthsBack, spreadDay(monthsBack, i, contractTrips));
+      // A trip can't be on a contract that had already ended.
+      const running = contracts.filter((c) => c.contractEndDate >= tripDate);
+      const contract = running[i % running.length];
       const vehicle = vehicles.find(
         (v) => v._id.toString() === contract.vehicleId.toString()
       );
@@ -227,6 +265,11 @@ async function seed() {
       const distance = round(contract.averageDistance + (i % 3) * 6 - 4);
       const rate = contract.rate;
       const salary = round(rate * 0.25);
+      // Km past the contract's average cost fuel and wear the fixed rate
+      // doesn't cover; the app deducts them from the trip's profit.
+      const runningCost = savariRates.get(vehicle._id.toString()).runningCost;
+      const excessKm = Math.max(0, distance - contract.averageDistance);
+      const excessCost = round(excessKm * runningCost);
 
       trips.push({
         tripType: 'contract',
@@ -240,11 +283,15 @@ async function seed() {
         driverSalaryPaid: monthsBack > 0 || i % 3 !== 0,
         isDriverSalaryManual: false,
         tripRate: rate,
-        ownerTakeHome: rate - salary,
+        ownerTakeHome: rate - salary - excessCost,
         startKm,
         endKm: startKm + distance,
         distance,
-        tripDate: inMonth(monthsBack, 2 + i * 3),
+        averageDistanceUsed: contract.averageDistance,
+        operationalCostUsed: runningCost,
+        excessKm,
+        excessCost,
+        tripDate,
         notes: i % 4 === 0 ? 'രാവിലത്തെ ട്രിപ്പ്' : undefined,
         userId
       });
@@ -253,12 +300,13 @@ async function seed() {
     // Savari trips, priced from the vehicle's own rates.
     for (let i = 0; i < savariTrips; i++) {
       const vehicle = vehicles[i % vehicles.length];
+      const rates = savariRates.get(vehicle._id.toString());
       const driver = drivers[(i + 2) % drivers.length];
 
       const startKm = 30000 + monthsBack * 700 + i * 45;
       const distance = 4 + i * 3;
       const additionalKm = distance > 5 ? distance - 5 : 0;
-      const rate = round(vehicle.fixedRateFor5Km + additionalKm * vehicle.perKmRate);
+      const rate = round(rates.fixed + additionalKm * rates.perKm);
       const salary = round(rate * 0.25);
 
       trips.push({
@@ -275,10 +323,10 @@ async function seed() {
         startKm,
         endKm: startKm + distance,
         distance,
-        fixedRateUsed: vehicle.fixedRateFor5Km,
-        perKmRateUsed: vehicle.perKmRate,
+        fixedRateUsed: rates.fixed,
+        perKmRateUsed: rates.perKm,
         additionalKm,
-        tripDate: inMonth(monthsBack, 1 + i * 4),
+        tripDate: inMonth(monthsBack, spreadDay(monthsBack, i, savariTrips)),
         userId
       });
     }

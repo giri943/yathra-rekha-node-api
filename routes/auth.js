@@ -4,7 +4,19 @@ const { OAuth2Client } = require('google-auth-library');
 const fetch = require('node-fetch');
 const User = require('../models/User');
 const authenticateToken = require('../middleware/auth');
+const attemptLimiter = require('../middleware/attemptLimiter');
 const router = express.Router();
+
+/// Failed sign-ins per account and per address. A 6-character password with
+/// no limit could be guessed by a script; these make that impractical while
+/// a person mistyping a few times never notices.
+const loginFailuresByAccount = attemptLimiter({ max: 8, windowMs: 15 * 60 * 1000 });
+const loginFailuresByIp = attemptLimiter({ max: 30, windowMs: 15 * 60 * 1000 });
+const TOO_MANY_ATTEMPTS = 'പലതവണ തെറ്റി. 15 മിനിറ്റ് കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക.';
+
+/// Every OAuth client of this app (web, each Android build) belongs to one
+/// Google Cloud project, and their ids all start with its number.
+const GOOGLE_PROJECT_PREFIX = (process.env.GOOGLE_CLIENT_ID || '').split('-')[0] + '-';
 
 const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
@@ -26,10 +38,29 @@ const verifyGoogleCredential = async ({ idToken, accessToken }) => {
       idToken,
       audience: process.env.GOOGLE_CLIENT_ID
     });
-    return ticket.getPayload();
+    const payload = ticket.getPayload();
+    if (!payload?.email_verified) throw new Error('Google email not verified');
+    return payload;
   }
 
   if (accessToken) {
+    // userinfo alone accepts an access token issued to ANY app the person
+    // has signed in to with Google; one of those apps could replay it here
+    // and take over their account. tokeninfo says which app it was issued to.
+    if (GOOGLE_PROJECT_PREFIX === '-') throw new Error('GOOGLE_CLIENT_ID is not set');
+    const infoResponse = await fetch(
+      `https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(accessToken)}`
+    );
+    if (!infoResponse.ok) throw new Error('Invalid Google access token');
+    const info = await infoResponse.json();
+    const issuedTo = info.azp || info.aud || '';
+    if (!issuedTo.startsWith(GOOGLE_PROJECT_PREFIX)) {
+      throw new Error('Google access token was issued to another app');
+    }
+    if (String(info.email_verified) !== 'true') {
+      throw new Error('Google email not verified');
+    }
+
     const response = await fetch(
       `https://www.googleapis.com/oauth2/v2/userinfo?access_token=${accessToken}`
     );
@@ -37,6 +68,7 @@ const verifyGoogleCredential = async ({ idToken, accessToken }) => {
       throw new Error('Failed to get user info from Google');
     }
     const userInfo = await response.json();
+    if (userInfo.id !== info.sub) throw new Error('Google token mismatch');
     return {
       sub: userInfo.id,
       email: userInfo.email,
@@ -51,7 +83,8 @@ const verifyGoogleCredential = async ({ idToken, accessToken }) => {
 // Register with email and phone
 router.post('/register', async (req, res) => {
   try {
-    const { name, email, phone, password } = req.body;
+    const { name, phone, password } = req.body;
+    const email = String(req.body.email || '').trim().toLowerCase();
 
     // Check if user already exists
     const existingUser = await User.findOne({ email });
@@ -79,32 +112,41 @@ router.post('/register', async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    if (error.name === 'ValidationError') {
+      return res.status(400).json({ message: 'വിവരങ്ങൾ ശരിയായി നൽകുക' });
+    }
+    console.error('register failed:', error.message);
+    res.status(500).json({ message: 'അക്കൗണ്ട് സൃഷ്ടിക്കാൻ കഴിഞ്ഞില്ല' });
   }
 });
 
 // Login with email or phone
 router.post('/login', async (req, res) => {
   try {
-    const { emailOrPhone, password } = req.body;
+    const { password } = req.body;
+    // Emails are stored lower-case; "Soman@gmail.com" used to find nobody.
+    const emailOrPhone = String(req.body.emailOrPhone || '').trim();
+    const accountKey = emailOrPhone.toLowerCase();
+
+    if (loginFailuresByAccount.isBlocked(accountKey) || loginFailuresByIp.isBlocked(req.ip)) {
+      return res.status(429).json({ message: TOO_MANY_ATTEMPTS });
+    }
 
     // Find user by email or phone
     const user = await User.findOne({
       $or: [
-        { email: emailOrPhone },
+        { email: accountKey },
         { phone: emailOrPhone }
       ]
     });
-    
-    if (!user) {
-      return res.status(401).json({ message: 'തെറ്റായ ഇമെയിൽ/ഫോൺ അല്ലെങ്കിൽ പാസ്വേഡ്' });
-    }
 
-    // Check password
-    const isMatch = await user.comparePassword(password);
+    const isMatch = user ? await user.comparePassword(password || '') : false;
     if (!isMatch) {
+      loginFailuresByAccount.fail(accountKey);
+      loginFailuresByIp.fail(req.ip);
       return res.status(401).json({ message: 'തെറ്റായ ഇമെയിൽ/ഫോൺ അല്ലെങ്കിൽ പാസ്വേഡ്' });
     }
+    loginFailuresByAccount.succeed(accountKey);
 
     // Generate token
     const token = generateToken(user._id);
@@ -228,6 +270,7 @@ router.delete('/delete', async (req, res) => {
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const user = await User.findByIdAndDelete(decoded.userId);
+    authenticateToken.forgetUser(decoded.userId);
     
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
@@ -249,6 +292,10 @@ router.post('/reset-password', async (req, res) => {
   try {
     const { newPassword, idToken, accessToken } = req.body;
 
+    if (loginFailuresByIp.isBlocked(req.ip)) {
+      return res.status(429).json({ message: TOO_MANY_ATTEMPTS });
+    }
+
     if (!newPassword || newPassword.length < 6) {
       return res.status(400).json({
         message: 'പാസ്വേഡിൽ കുറഞ്ഞത് 6 അക്ഷരം വേണം'
@@ -263,6 +310,7 @@ router.post('/reset-password', async (req, res) => {
     }
 
     if (!payload?.email) {
+      loginFailuresByIp.fail(req.ip);
       return res.status(401).json({
         message: 'സ്ഥിരീകരിക്കാൻ കഴിഞ്ഞില്ല. Google വഴി തുടരുക.'
       });
@@ -277,7 +325,9 @@ router.post('/reset-password', async (req, res) => {
     // Keep the accounts linked so both sign-in methods stay in sync.
     if (!user.googleId) user.googleId = payload.sub;
     user.password = newPassword;
+    // Saving a new password sets passwordChangedAt, signing out every device.
     await user.save();
+    authenticateToken.forgetUser(user._id);
 
     res.json({ message: 'പാസ്വേഡ് മാറ്റി' });
   } catch (error) {
@@ -313,8 +363,11 @@ router.post('/set-password', authenticateToken, async (req, res) => {
 
     user.password = newPassword;
     await user.save();
+    authenticateToken.forgetUser(user._id);
 
-    res.json({ message: 'പാസ്വേഡ് സേവ് ചെയ്തു' });
+    // Other devices are now signed out; this one gets a fresh token so the
+    // person changing their password is not thrown out with them.
+    res.json({ message: 'പാസ്വേഡ് സേവ് ചെയ്തു', token: generateToken(user._id) });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

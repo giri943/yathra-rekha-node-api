@@ -5,6 +5,10 @@ const morgan = require('morgan');
 require('dotenv').config();
 
 const app = express();
+
+// Render sits behind one proxy; without this every request's req.ip is the
+// proxy's, and per-address sign-in limits would block everyone at once.
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 
 // Middleware
@@ -21,31 +25,8 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/yathra-re
 .then(() => console.log('Connected to MongoDB'))
 .catch(err => console.error('MongoDB connection error:', err));
 
-// Image proxy route for CORS
-app.get('/api/proxy-image', async (req, res) => {
-  try {
-    const { url } = req.query;
-    if (!url) {
-      return res.status(400).json({ error: 'URL parameter required' });
-    }
-    
-    const fetch = require('node-fetch');
-    const response = await fetch(url);
-    
-    if (!response.ok) {
-      return res.status(404).json({ error: 'Image not found' });
-    }
-    
-    res.set({
-      'Content-Type': response.headers.get('content-type'),
-      'Cache-Control': 'public, max-age=86400'
-    });
-    
-    response.body.pipe(res);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to proxy image' });
-  }
-});
+// NOTE: /api/proxy-image was removed. It fetched any URL for anyone, letting
+// the server be used to reach internal addresses (SSRF). Nothing called it.
 
 // Routes
 app.use('/api/auth', require('./routes/auth'));

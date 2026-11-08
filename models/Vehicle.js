@@ -73,6 +73,11 @@ const vehicleSchema = new mongoose.Schema({
   /// (₹500 + ₹15/km against a Jeep default of ₹250 + ₹22/km), so his win.
   fixedRateFor5Km: ownRate,
   perKmRate: ownRate,
+
+  /// His own running cost per km (fuel and wear), for the profit lost when a
+  /// contract trip runs past the contract's average distance. Unset: the
+  /// classification's estimate applies.
+  operationalCostPerKm: ownRate,
 }, {
   timestamps: true,
 });

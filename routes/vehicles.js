@@ -17,7 +17,7 @@ const BAD_RATE = 'നിരക്ക് ശരിയായ സംഖ്യയാ
  */
 function ownRatesFrom(body) {
   const rates = {};
-  for (const key of ['fixedRateFor5Km', 'perKmRate']) {
+  for (const key of ['fixedRateFor5Km', 'perKmRate', 'operationalCostPerKm']) {
     if (!(key in body)) continue;
     const raw = body[key];
     if (raw === null || raw === '' || raw === undefined) {

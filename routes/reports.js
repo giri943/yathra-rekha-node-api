@@ -1,16 +1,8 @@
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
 const router = express.Router();
 const PDFDocument = require('pdfkit');
-
-/// Gayathri (Swathanthra Malayalam Computing). Chosen because fontkit — which
-/// PDFKit uses for shaping — crashes on Noto Sans/Serif Malayalam, and
-/// Malayalam needs real glyph reordering, not just a glyph table.
-const MALAYALAM_FONT = path.join(__dirname, '..', 'assets', 'fonts', 'Gayathri-Regular.ttf');
-
-/// Any character in the Malayalam Unicode block.
-const MALAYALAM = /[ഀ-ൿ]/;
+const { buildContractBill } = require('../services/contractBill');
+const User = require('../models/User');
 const Contract = require('../models/Contract');
 const Trip = require('../models/Trip');
 const Vehicle = require('../models/Vehicle');
@@ -191,6 +183,8 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
             revenue: { $sum: '$tripRate' },
             driverSalary: { $sum: '$driverSalary' },
             distance: { $sum: { $ifNull: ['$distance', 0] } },
+            excessKm: { $sum: { $ifNull: ['$excessKm', 0] } },
+            excessCost: { $sum: { $ifNull: ['$excessCost', 0] } },
             lastTripDate: { $max: '$tripDate' }
           }
         },
@@ -205,6 +199,8 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
         revenue: row.revenue,
         driverSalary: row.driverSalary,
         distance: row.distance,
+        excessKm: row.excessKm,
+        excessCost: row.excessCost,
         lastTripDate: row.lastTripDate
       }));
     };
@@ -424,34 +420,12 @@ router.get('/contract-billing/:contractId', authenticateToken, async (req, res) 
       .populate('vehicleId')
       .sort({ tripDate: 1 });
 
-    // Calculate totals
-    const totalTrips = trips.length;
-    const totalAmount = trips.reduce((sum, trip) => sum + trip.tripRate, 0);
-    const totalDistance = trips.reduce((sum, trip) => sum + (trip.distance || 0), 0);
+    // The customer's language, chosen in the app when the bill is made.
+    // Older app builds send nothing and keep getting the English bill.
+    const lang = req.query.lang === 'ml' ? 'ml' : 'en';
+    const owner = await User.findById(req.user.id).select('name phone').lean();
 
-    // Create PDF
-    const doc = new PDFDocument({ margin: 50 });
-
-    // Malayalam needs an embedded font: PDFKit's built-in Helvetica has no
-    // Malayalam glyphs, so contract and client names written in Malayalam
-    // would come out blank. Registered once here and used for every string
-    // that can contain user-entered text.
-    let malayalamFont = null;
-    if (fs.existsSync(MALAYALAM_FONT)) {
-      doc.registerFont('malayalam', MALAYALAM_FONT);
-      malayalamFont = 'malayalam';
-    }
-
-    /// Picks the embedded font only when the text actually needs it, so the
-    /// English labels keep Helvetica's tighter metrics.
-    ///
-    /// Takes the same arguments as doc.text — both (text, options) and
-    /// (text, x, y, options) forms.
-    const write = (text, ...rest) => {
-      const value = String(text ?? '');
-      doc.font(malayalamFont && MALAYALAM.test(value) ? malayalamFont : 'Helvetica');
-      return doc.text(value, ...rest);
-    };
+    const doc = new PDFDocument({ margin: 50, size: 'A4' });
 
     res.setHeader('Content-Type', 'application/pdf');
 
@@ -475,102 +449,14 @@ router.get('/contract-billing/:contractId', authenticateToken, async (req, res) 
 
     doc.pipe(res);
 
-    // Header
-    doc.fontSize(20).text('BILLING REPORT', { align: 'center' });
-    doc.moveDown();
-    doc.fontSize(12).text('Yathra Rekha - Vehicle Management', { align: 'center' });
-    doc.moveDown(2);
-
-    // Contract Details
-    doc.fontSize(14).text('Contract Details:', { underline: true });
-    doc.moveDown(0.5);
-    doc.fontSize(11);
-    write(`Contract Name: ${contract.contractName}`);
-    write(`Contract Rate: Rs. ${contract.rate.toFixed(2)} per trip`);
-    write(`Average Distance: ${contract.averageDistance.toFixed(1)} km`);
-    write(`Vehicle: ${contract.vehicleId?.vehicleNumber || 'N/A'} - ${contract.vehicleId?.model || 'N/A'}`);
-    if (contract.contactPhone) {
-      write(`Contact: ${contract.contactPhone}`);
-    }
-    // Contracts have no start date on the model, so this printed
-    // "NaN/NaN/NaN" on every bill. Only the end date is known.
-    write(`Contract Valid Until: ${formatDate(contract.contractEndDate)}`);
-
-    if (startDate && endDate) {
-      write(`Billing Period: ${formatDate(new Date(startDate))} to ${formatDate(new Date(endDate))}`);
-    }
-    doc.moveDown(2);
-
-    // Summary
-    doc.fontSize(14).text('Summary:', { underline: true });
-    doc.moveDown(0.5);
-    doc.fontSize(11);
-    doc.text(`Total Trips: ${totalTrips}`);
-    doc.text(`Total Distance: ${totalDistance.toFixed(1)} km`);
-    doc.text(`Average Distance per Trip: ${totalTrips > 0 ? (totalDistance / totalTrips).toFixed(1) : '0.0'} km`);
-    doc.fontSize(13).fillColor('green').text(`Total Amount: Rs. ${totalAmount.toFixed(2)}`, { bold: true });
-    doc.fillColor('black');
-    doc.moveDown(2);
-
-    // Trip Details Table
-    doc.fontSize(14).text('Trip Details:', { underline: true });
-    doc.moveDown(0.5);
-
-    // Table headers
-    const tableTop = doc.y;
-    const col1 = 50;
-    const col2 = 120;
-    const col3 = 220;
-    const col4 = 320;
-    const col5 = 420;
-    const col6 = 500;
-
-    doc.fontSize(10).fillColor('blue');
-    doc.text('Date', col1, tableTop);
-    doc.text('Vehicle', col2, tableTop);
-    doc.text('Driver', col3, tableTop);
-    doc.text('Distance', col4, tableTop);
-    doc.text('Rate', col5, tableTop);
-    doc.text('Notes', col6, tableTop);
-    doc.fillColor('black');
-
-    // Draw line under headers
-    doc.moveTo(col1, tableTop + 15).lineTo(570, tableTop + 15).stroke();
-
-    let yPosition = tableTop + 25;
-
-    // Trip rows
-    trips.forEach((trip, index) => {
-      if (yPosition > 700) {
-        doc.addPage();
-        yPosition = 50;
-      }
-
-      doc.fontSize(9);
-      write(formatDate(trip.tripDate), col1, yPosition, { width: 60 });
-      write(trip.vehicleId?.vehicleNumber || 'N/A', col2, yPosition, { width: 90 });
-      // Driver names and notes are the fields most likely to be in Malayalam.
-      write(trip.driverName, col3, yPosition, { width: 90 });
-      write(`${(trip.distance || 0).toFixed(1)} km`, col4, yPosition, { width: 90 });
-      write(`Rs. ${trip.tripRate.toFixed(2)}`, col5, yPosition, { width: 70 });
-      write(trip.notes || '-', col6, yPosition, { width: 70 });
-
-      yPosition += 20;
+    buildContractBill(doc, {
+      contract,
+      trips,
+      owner,
+      lang,
+      startDate: startDate && endDate ? new Date(startDate) : null,
+      endDate: startDate && endDate ? new Date(endDate) : null,
     });
-
-    // Footer
-    doc.moveDown(3);
-    yPosition = doc.y;
-    if (yPosition > 700) {
-      doc.addPage();
-      yPosition = 50;
-    }
-
-    doc.fontSize(10);
-    doc.text('_'.repeat(80), 50, yPosition);
-    doc.moveDown(0.5);
-    doc.text(`Generated on: ${formatDate(new Date())}`, { align: 'center' });
-    doc.text('Thank you for your business!', { align: 'center' });
 
     doc.end();
 
@@ -580,13 +466,5 @@ router.get('/contract-billing/:contractId', authenticateToken, async (req, res) 
   }
 });
 
-// Helper function to format date
-function formatDate(date) {
-  const d = new Date(date);
-  const day = String(d.getDate()).padStart(2, '0');
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const year = d.getFullYear();
-  return `${day}/${month}/${year}`;
-}
 
 module.exports = router;

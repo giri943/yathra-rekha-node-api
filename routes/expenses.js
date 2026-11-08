@@ -1,7 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const Expense = require('../models/Expense');
+const Vehicle = require('../models/Vehicle');
 const auth = require('../middleware/auth');
+const { queryFrom, containsRegex, vehicleIdsMatching } = require('../utils/search');
 
 // List expenses, newest first, optionally scoped to a month or a vehicle.
 router.get('/', auth, async (req, res) => {
@@ -23,20 +25,40 @@ router.get('/', auth, async (req, res) => {
       }
     }
 
+    // Free-text search over notes and vehicle number. Category names are in
+    // Malayalam on the phone and stored as keys here, so the app matches the
+    // label itself and sends the keys it hit as `categories`.
+    const q = queryFrom(req);
+    if (q) {
+      const categories = String(req.query.categories || '')
+        .split(',')
+        .map((c) => c.trim())
+        .filter(Boolean);
+      filter.$or = [
+        { notes: containsRegex(q) },
+        { vehicleId: { $in: await vehicleIdsMatching(Vehicle, req.user.id, q) } },
+        ...(categories.length ? [{ category: { $in: categories } }] : []),
+      ];
+    }
+
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 50;
 
-    const [expenses, total] = await Promise.all([
+    const [expenses, total, sums] = await Promise.all([
       Expense.find(filter)
         .populate('vehicleId', 'vehicleNumber model')
         .sort({ expenseDate: -1, createdAt: -1 })
         .skip((page - 1) * limit)
         .limit(limit),
-      Expense.countDocuments(filter)
+      Expense.countDocuments(filter),
+      // The total of everything matched, not just this page, so a paged
+      // list can still show an honest figure.
+      Expense.aggregate([{ $match: filter }, { $group: { _id: null, amount: { $sum: '$amount' } } }])
     ]);
 
     res.json({
       expenses,
+      totalAmount: sums[0]?.amount || 0,
       pagination: {
         page,
         limit,
