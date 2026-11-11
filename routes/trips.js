@@ -151,6 +151,14 @@ router.post('/', auth, async (req, res) => {
       delete tripData.contractId;
     }
 
+    // Marked unpaid again: forget how it was paid, or the trip would show
+    // an old UPI reference for money still owed.
+    if (tripData.driverSalaryPaid === false) {
+      tripData.salaryPaidAt = null;
+      tripData.salaryPaidVia = null;
+      tripData.salaryPaymentRef = null;
+    }
+
     // Auto-calculate distance for all trips with km data
     if (tripData.startKm && tripData.endKm) {
       tripData.distance = tripData.endKm - tripData.startKm;
@@ -183,7 +191,7 @@ router.post('/', auth, async (req, res) => {
 // dashboard's "owed" figure, so exactly the trips the owner was shown.
 router.post('/settle-salary', auth, async (req, res) => {
   try {
-    const { driverId, driverName, until } = req.body;
+    const { driverId, driverName, until, createdBefore, via, reference } = req.body;
     const filter = { userId: req.user.id, driverSalaryPaid: false };
     if (driverId) {
       filter.driverId = driverId;
@@ -201,8 +209,36 @@ router.post('/settle-salary', auth, async (req, res) => {
       filter.tripDate = { $lte: end };
     }
 
-    const result = await Trip.updateMany(filter, { $set: { driverSalaryPaid: true } });
-    res.json({ updated: result.modifiedCount });
+    // Only trips that existed when the amount was shown: a trip saved while
+    // he was paying was not in what he paid, so it stays owed.
+    if (createdBefore) {
+      const asOf = new Date(createdBefore);
+      if (Number.isNaN(asOf.getTime())) {
+        return res.status(400).json({ message: 'createdBefore is not a valid date' });
+      }
+      // A trip with no createdAt (none today) is older than any screen.
+      filter.$or = [{ createdAt: { $lte: asOf } }, { createdAt: { $exists: false } }];
+    }
+
+    if (via !== undefined && !['cash', 'upi'].includes(via)) {
+      return res.status(400).json({ message: "via must be 'cash' or 'upi'" });
+    }
+    const ref = typeof reference === 'string' ? reference.trim().slice(0, 100) : '';
+
+    const trips = await Trip.find(filter).select('_id driverSalary').lean();
+    const amount = trips.reduce((sum, t) => sum + (t.driverSalary || 0), 0);
+    const result = await Trip.updateMany(
+      { _id: { $in: trips.map((t) => t._id) }, driverSalaryPaid: false },
+      {
+        $set: {
+          driverSalaryPaid: true,
+          salaryPaidAt: new Date(),
+          salaryPaidVia: via || 'cash',
+          salaryPaymentRef: ref || null
+        }
+      }
+    );
+    res.json({ updated: result.modifiedCount, amount });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

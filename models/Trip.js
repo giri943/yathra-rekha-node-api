@@ -59,6 +59,25 @@ const tripSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  // How the salary was paid, set when it is marked paid from the salary
+  // card: so a driver who says "I didn't get it" can be answered from the
+  // bank statement. Null for trips marked paid by hand on the trip itself.
+  salaryPaidAt: {
+    type: Date,
+    default: null
+  },
+  salaryPaidVia: {
+    type: String,
+    enum: ['cash', 'upi', null],
+    default: null
+  },
+  // The UPI app's transaction / approval reference, as on the bank statement.
+  salaryPaymentRef: {
+    type: String,
+    trim: true,
+    maxlength: 100,
+    default: null
+  },
   isDriverSalaryManual: {
     type: Boolean,
     default: false

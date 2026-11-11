@@ -21,6 +21,19 @@ async function nameTaken(userId, name, exceptId) {
   return drivers.some((d) => String(d._id) !== String(exceptId) && sameName(d.name, name));
 }
 
+// People paste UPI ids with spaces or capitals; '' or null removes it.
+function cleanUpiId(value) {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  const cleaned = String(value).replace(/\s+/g, '').toLowerCase();
+  return cleaned || null;
+}
+
+// An edit sends only what changed; leave the rest as it is.
+function withoutUndefined(fields) {
+  return Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
+}
+
 // Get all drivers
 router.get('/', auth, async (req, res) => {
   try {
@@ -34,13 +47,14 @@ router.get('/', auth, async (req, res) => {
 // Add new driver
 router.post('/', auth, async (req, res) => {
   try {
-    const { name, phone } = req.body;
+    const { name, phone, upiId } = req.body;
     if (await nameTaken(req.user.id, name)) {
       return res.status(409).json({ message: DUPLICATE_NAME });
     }
     const driver = new Driver({
       name,
       phone,
+      upiId: cleanUpiId(upiId),
       userId: req.user.id
     });
     await driver.save();
@@ -53,7 +67,7 @@ router.post('/', auth, async (req, res) => {
 // Update driver
 router.put('/:id', auth, async (req, res) => {
   try {
-    const { name, phone } = req.body;
+    const { name, phone, upiId } = req.body;
     const previous = await Driver.findOne({ _id: req.params.id, userId: req.user.id });
     if (!previous) {
       return res.status(404).json({ message: 'Driver not found' });
@@ -64,7 +78,7 @@ router.put('/:id', auth, async (req, res) => {
 
     const driver = await Driver.findOneAndUpdate(
       { _id: req.params.id, userId: req.user.id },
-      { name, phone },
+      withoutUndefined({ name, phone, upiId: cleanUpiId(upiId) }),
       { new: true, runValidators: true }
     );
 
@@ -108,6 +122,7 @@ router.get('/:id/summary', auth, async (req, res) => {
       return res.status(404).json({ message: 'ഈ ഡ്രൈവറെ കണ്ടെത്തിയില്ല' });
     }
 
+    const asOf = new Date(); // see /reports/dashboard
     const now = businessNow();
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
     const totalsFor = (extra) => Trip.aggregate([
@@ -136,7 +151,7 @@ router.get('/:id/summary', auth, async (req, res) => {
       totalsFor({ driverSalaryPaid: false }),
     ]);
 
-    res.json({ driver, allTime, thisMonth, unpaid });
+    res.json({ driver, allTime, thisMonth, unpaid, asOf });
   } catch (error) {
     res.status(500).json({ message: 'വിവരങ്ങൾ കിട്ടിയില്ല. വീണ്ടും ശ്രമിക്കുക.' });
   }

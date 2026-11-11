@@ -297,6 +297,7 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
       ? new Date(year, month - 2, Math.min(now.getDate(), previousMonthDays), 23, 59, 59, 999)
       : new Date(year, month - 1, 0, 23, 59, 59, 999);
 
+    const asOf = new Date();
     const [
       today,
       monthTotals,
@@ -323,7 +324,7 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
       Vehicle.find({ userId }).select(
         'vehicleNumber insuranceExpiry taxDate testDate pollutionDate'
       ),
-      Driver.find({ userId }).select('name phone'),
+      Driver.find({ userId }).select('name phone upiId'),
       Trip.exists({ userId })
     ]);
 
@@ -341,14 +342,19 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
     // Attach phone numbers so the owner can ring a driver straight from the
     // amount owed: by id, or by name for trips saved before driver ids. No
     // number when the driver has since been deleted.
-    const phoneById = new Map(drivers.map((d) => [String(d._id), d.phone]));
-    const phoneByName = new Map(drivers.map((d) => [normaliseName(d.name), d.phone]));
-    unpaid.drivers = unpaid.drivers.map((entry) => ({
-      ...entry,
-      phone: (entry.driverId
-        ? phoneById.get(entry.driverId)
-        : phoneByName.get(normaliseName(entry.driverName))) || null
-    }));
+    // The UPI id comes along so he can pay from the same card.
+    const driverById = new Map(drivers.map((d) => [String(d._id), d]));
+    const driverByName = new Map(drivers.map((d) => [normaliseName(d.name), d]));
+    unpaid.drivers = unpaid.drivers.map((entry) => {
+      const driver = entry.driverId
+        ? driverById.get(String(entry.driverId))
+        : driverByName.get(normaliseName(entry.driverName));
+      return {
+        ...entry,
+        phone: driver?.phone || null,
+        upiId: driver?.upiId || null
+      };
+    });
 
     // Documents already expired, or expiring within 30 days.
     // Expired entries come first — they are the urgent ones.
@@ -388,7 +394,9 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
       previous: withExpenses(previousTotals, previousExpenses),
       // Tells the app which comparison it is showing, so it can say so.
       previousIsToDate: isCurrentMonth,
-      unpaidDriverSalary: unpaid,
+      // When the owed amounts were worked out: settling from this card marks
+      // only trips saved before it, so a trip added meanwhile stays owed.
+      unpaidDriverSalary: { ...unpaid, asOf },
       clients,
       vehicles,
       expiringDocuments,
