@@ -21,6 +21,8 @@ const bot = require('../services/telegram/bot');
 const Trip = require('../models/Trip');
 const Vehicle = require('../models/Vehicle');
 const Contract = require('../models/Contract');
+const Driver = require('../models/Driver');
+const { date: fmtDate } = require('../services/telegram/format');
 const User = require('../models/User');
 const TelegramLink = require('../models/TelegramLink');
 const SalaryNotice = require('../models/SalaryNotice');
@@ -103,12 +105,23 @@ test('Telegram bot', { skip }, async (t) => {
 
   const driverA = new mongoose.Types.ObjectId();
   const driverB = new mongoose.Types.ObjectId();
+  // Raju has a phone number, for the WhatsApp button on his statement.
+  await Driver.create({ _id: driverB, name: 'Raju', phone: '98765 00000', userId });
   const contract = await Contract.create({
     contractName: 'ABC School',
     rate: 1000,
     vehicleId: vehicle._id,
     averageDistance: 20,
     contractEndDate: at(2027, 3, 31),
+    userId
+  });
+  // Ends a week after "today" (12 Nov): in the morning message.
+  await Contract.create({
+    contractName: 'Hospital run',
+    rate: 800,
+    vehicleId: vehicle._id,
+    averageDistance: 10,
+    contractEndDate: at(2026, 11, 19),
     userId
   });
   const baseTrip = {
@@ -168,6 +181,9 @@ test('Telegram bot', { skip }, async (t) => {
     assert.deepEqual(sent().map((m) => m.chatId).sort(), [OWNER, SON]);
     assert.match(sent()[0].text, /ടാക്സ്: 2 ദിവസം മുൻപ് തീർന്നു/);
     assert.match(sent()[0].text, /ഇൻഷുറൻസ്: 5 ദിവസം ബാക്കി/);
+    assert.ok(sent()[0].text.includes('📄 <b>കരാറുകൾ തീരാറായി</b>'));
+    assert.ok(sent()[0].text.includes('Hospital run</b>: 7 ദിവസത്തിൽ തീരും (19/11/2026)'));
+    assert.ok(!sent()[0].text.includes('ABC School'), 'a contract far from its end is not mentioned');
 
     outbox = [];
     await bot.runDueJobs({ now: at(2026, 11, 12, 9, 5) }); // the second wake-up call
@@ -190,6 +206,30 @@ test('Telegram bot', { skip }, async (t) => {
     const notice = await SalaryNotice.findOne({ driverName: 'Girish' });
     assert.equal(notice.messages.length, 2);
     assert.equal(notice.tripIds.length, 2);
+  });
+
+  await t.test('8:30 PM: the day in figures, to both, once', async () => {
+    outbox = [];
+    await bot.runDueJobs({ now: at(2026, 11, 12, 20, 29) });
+    assert.equal(outbox.length, 0);
+
+    await bot.runDueJobs({ now: at(2026, 11, 12, 20, 30) });
+    assert.deepEqual(sent().map((m) => m.chatId).sort(), [OWNER, SON]);
+    const text = sent()[0].text;
+    assert.ok(text.startsWith('📋 <b>ഇന്ന് (12/11)</b>'));
+    assert.ok(text.includes('ട്രിപ്പ്: 3 (കരാർ 3, സവാരി 0)'));
+    assert.ok(text.includes('വരുമാനം: ₹3,000'));
+
+    outbox = [];
+    await bot.runDueJobs({ now: at(2026, 11, 12, 20, 35) });
+    assert.equal(outbox.length, 0, 'not sent twice');
+
+    // A day with nothing entered: a nudge instead.
+    await TelegramSettings.updateOne({ userId }, { $set: { documents: false, salary: false } });
+    outbox = [];
+    await bot.runDueJobs({ now: at(2026, 11, 14, 20, 30) });
+    assert.match(sent()[0].text, /ട്രിപ്പ് ഒന്നും ചേർത്തിട്ടില്ല/);
+    await TelegramSettings.updateOne({ userId }, { $set: { documents: true, salary: true } });
   });
 
   await t.test('paid: asks first; "no" puts the button back', async () => {
@@ -264,17 +304,101 @@ test('Telegram bot', { skip }, async (t) => {
     assert.match(sent()[0].text, /\(ഇതുവരെ\)/);
   });
 
-  await t.test('1st of the month: report and the contract bill PDF', async () => {
+  await t.test('renewing a document from its reminder', async () => {
+    // The 9 AM message carries a button per document.
+    outbox = [];
+    await bot.handleUpdate(message(OWNER, 'രേഖകൾ'));
+    const buttons = sent()[0].extra.reply_markup.inline_keyboard.map((row) => row[0]);
+    const insurance = buttons.find((b) => b.text.includes('ഇൻഷുറൻസ്'));
+    assert.ok(insurance, 'insurance has a renew button');
+
+    // Press it: asked for the date.
+    outbox = [];
+    await bot.handleUpdate(press(OWNER, 50, insurance.callback_data));
+    assert.match(sent()[0].text, /KL-07-AB-1234 ഇൻഷുറൻസ്/);
+    assert.equal(sent()[0].extra.reply_markup.force_reply, true);
+
+    // A wrong date is explained, and it keeps waiting.
+    outbox = [];
+    await bot.handleUpdate(message(OWNER, '31/02/2027'));
+    assert.match(sent()[0].text, /തീയതി ഇല്ല/);
+
+    // A right one is repeated back, spelt out.
+    outbox = [];
+    await bot.handleUpdate(message(OWNER, '17/11/2027'));
+    assert.ok(sent()[0].text.includes('17 നവംബർ 2027'));
+    let [[yes, change], [cancel]] = sent()[0].extra.reply_markup.inline_keyboard;
+    assert.ok(cancel);
+
+    // "Change": asked again; then the corrected date.
+    outbox = [];
+    await bot.handleUpdate(press(OWNER, 51, change.callback_data));
+    assert.equal(sent()[0].extra.reply_markup.force_reply, true);
+    outbox = [];
+    await bot.handleUpdate(message(OWNER, '18/11/2027'));
+    [[yes]] = sent()[0].extra.reply_markup.inline_keyboard;
+
+    // Yes: saved, and the son is told.
+    outbox = [];
+    await bot.handleUpdate(press(OWNER, 52, yes.callback_data, 'Owner'));
+    const saved = await Vehicle.findById(vehicle._id).setOptions({ excludeClassification: true }).lean();
+    assert.equal(fmtDate(saved.insuranceExpiry), '18/11/2027');
+    assert.match(sent('edit')[0].text, /18\/11\/2027 വരെ പുതുക്കി · Owner/);
+    assert.ok(sent().some((m) => m.chatId === SON && /പുതുക്കി/.test(m.text)));
+    assert.equal(sent('answer')[0].text, 'പുതുക്കി');
+    assert.equal((await TelegramLink.findOne({ chatId: OWNER })).pending, null);
+
+    // The same button again: stale, nothing changes.
+    outbox = [];
+    await bot.handleUpdate(press(OWNER, 52, yes.callback_data));
+    assert.match(sent('answer')[0].text, /പഴയതാണ്/);
+
+    // Renewed: no longer in the reminder list.
+    outbox = [];
+    await bot.handleUpdate(message(OWNER, 'രേഖകൾ'));
+    assert.ok(!sent()[0].text.includes('ഇൻഷുറൻസ്'));
+  });
+
+  await t.test('a renewal waiting for its date: cancel word, or a quick button, drops it', async () => {
+    outbox = [];
+    await bot.handleUpdate(message(OWNER, 'രേഖകൾ'));
+    const tax = sent()[0].extra.reply_markup.inline_keyboard.map((r) => r[0])
+      .find((b) => b.text.includes('ടാക്സ്'));
+
+    await bot.handleUpdate(press(OWNER, 60, tax.callback_data));
+    outbox = [];
+    await bot.handleUpdate(message(OWNER, 'വേണ്ട'));
+    assert.match(sent()[0].text, /ഒന്നും മാറ്റിയില്ല/);
+    assert.equal((await TelegramLink.findOne({ chatId: OWNER })).pending, null);
+
+    await bot.handleUpdate(press(OWNER, 61, tax.callback_data));
+    outbox = [];
+    await bot.handleUpdate(message(OWNER, 'ഈ മാസം'));
+    assert.match(sent()[0].text, /\(ഇതുവരെ\)/);
+    assert.equal((await TelegramLink.findOne({ chatId: OWNER })).pending, null);
+
+    const unchanged = await Vehicle.findById(vehicle._id).setOptions({ excludeClassification: true }).lean();
+    assert.equal(fmtDate(unchanged.taxDate), '10/11/2026');
+  });
+
+  await t.test('1st of the month: report, contract bill PDF, driver statements', async () => {
     await TelegramSettings.updateOne({ userId }, { $set: { documents: false } });
     outbox = [];
     await bot.runDueJobs({ now: at(2026, 11, 1, 9, 0) });
-    const reports = sent().filter((m) => m.chatId === OWNER);
-    assert.equal(reports.length, 1);
-    assert.match(reports[0].text, /ഒക്ടോബർ 2026/);
+    const toOwner = sent().filter((m) => m.chatId === OWNER);
+    assert.match(toOwner[0].text, /ഒക്ടോബർ 2026/);
     const bills = sent('document');
     assert.deepEqual(bills.map((b) => b.chatId).sort(), [OWNER, SON]);
     assert.match(bills[0].filename, /^bill-ABC School-2026-10\.pdf$/);
     assert.ok(bills[0].size > 1000, 'a real PDF');
+
+    // October had one trip, Raju's, already paid.
+    assert.match(toOwner[1].text, /ഡ്രൈവർമാരുടെ ഒക്ടോബർ 2026 കണക്ക്<\/b> \(1\)/);
+    const statement = toOwner[2];
+    assert.ok(statement.text.startsWith('🧾 <b>Raju</b> · ഒക്ടോബർ 2026'));
+    assert.ok(statement.text.includes('ബാക്കി: ഇല്ല ✅'));
+    const whatsApp = statement.extra.reply_markup.inline_keyboard[0][0];
+    assert.match(whatsApp.url, /^https:\/\/wa\.me\/919876500000\?text=/);
   });
 
   await t.test('a chat that blocked the bot is unlinked', async () => {
@@ -289,10 +413,10 @@ test('Telegram bot', { skip }, async (t) => {
     let status = await bot.status(userId);
     assert.equal(status.available, true);
     assert.equal(status.links.length, 1);
-    assert.deepEqual(status.settings, { documents: false, salary: true, monthly: true });
+    assert.deepEqual(status.settings, { documents: false, salary: true, monthly: true, evening: true });
 
-    status = await bot.updateSettings(userId, { documents: true, salary: 'yes' });
-    assert.deepEqual(status.settings, { documents: true, salary: true, monthly: true });
+    status = await bot.updateSettings(userId, { documents: true, salary: 'yes', evening: false });
+    assert.deepEqual(status.settings, { documents: true, salary: true, monthly: true, evening: false });
 
     outbox = [];
     assert.equal(await bot.removeLink(userId, status.links[0].id), true);

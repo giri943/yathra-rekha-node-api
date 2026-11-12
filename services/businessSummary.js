@@ -18,9 +18,9 @@ const { normaliseName } = require('../utils/names');
 // Profit  = revenue - expense
 //
 // Shared by GET /reports/dashboard and the Telegram bot, so both always show
-// the same figures. [query] takes year and month (1-12), as the route does.
-async function buildDashboard(userId, query = {}) {
-  const now = businessNow();
+// the same figures. [query] takes year and month (1-12), as the route does;
+// [now] is for tests (Kerala wall clock, as businessNow() gives it).
+async function buildDashboard(userId, query = {}, { now = businessNow() } = {}) {
 
   // Month is 1-12 in the query; JS Date months are 0-11.
   const year = parseInt(query.year) || now.getFullYear();

@@ -44,11 +44,11 @@ test('documents due: most urgent first, only on reminder days', () => {
   // The button lists everything within 30 days, reminder day or not.
   const all = fmt.documentsDue(vehicles, today, { all: true });
   assert.equal(all.length, 3);
-  assert.match(fmt.documentsMessage([], { all: true }), /ഒരു രേഖയും തീരുന്നില്ല/);
+  assert.match(fmt.documentsMessage([], { all: true }), /ഒരു രേഖയും കരാറും തീരുന്നില്ല/);
 });
 
 test('scheduled messages: once each, at their hour', () => {
-  const fresh = { documents: true, salary: true, monthly: true, sent: {} };
+  const fresh = { documents: true, salary: true, monthly: true, evening: true, sent: {} };
   const jobs = (now, settings = fresh) => fmt.dueJobs(now, settings).map((j) => j.job);
 
   assert.deepEqual(jobs(at(2026, 11, 12, 8, 59)), []);
@@ -56,8 +56,14 @@ test('scheduled messages: once each, at their hour', () => {
   assert.deepEqual(jobs(at(2026, 11, 12, 19, 0)), ['documents', 'salary']);
   assert.deepEqual(jobs(at(2026, 12, 1, 9, 5)), ['documents', 'monthly']);
 
+  assert.deepEqual(jobs(at(2026, 11, 12, 20, 29)), ['documents', 'salary']);
+  assert.deepEqual(jobs(at(2026, 11, 12, 20, 30)), ['documents', 'salary', 'evening']);
+
   const sentToday = { ...fresh, sent: { documents: '2026-11-12', salary: '2026-11-12' } };
   assert.deepEqual(jobs(at(2026, 11, 12, 19, 5), sentToday), []);
+  const allSent = { ...fresh, sent: { ...sentToday.sent, evening: '2026-11-12' } };
+  assert.deepEqual(jobs(at(2026, 11, 12, 20, 35), allSent), []);
+  assert.deepEqual(jobs(at(2026, 11, 12, 20, 30), { ...fresh, evening: false }), ['documents', 'salary']);
   assert.deepEqual(jobs(at(2026, 11, 13, 9, 0), sentToday), ['documents']);
 
   const salaryOff = { ...fresh, salary: false };
@@ -190,4 +196,182 @@ test('chat name from Telegram', () => {
   assert.equal(fmt.chatName({ first_name: 'Girish', last_name: 'Soman' }), 'Girish Soman');
   assert.equal(fmt.chatName({ username: 'giri' }), '@giri');
   assert.equal(fmt.chatName(undefined), '');
+});
+
+test('contracts: reminded 30 days before and the last week, never after', () => {
+  const reminded = [];
+  for (let d = 40; d >= -10; d--) if (fmt.contractRemindsOn(d)) reminded.push(d);
+  assert.deepEqual(reminded, [30, 7, 6, 5, 4, 3, 2, 1, 0]);
+
+  const today = at(2026, 11, 12, 9);
+  const contracts = [
+    { contractName: 'ABC School', contractEndDate: at(2026, 11, 19, 0) }, // 7 days
+    { contractName: 'Old job', contractEndDate: at(2026, 11, 1, 0) },     // ended
+    { contractName: 'Hospital', contractEndDate: at(2026, 11, 12, 0) },   // today
+    { contractName: 'Later', contractEndDate: at(2026, 11, 25, 0) }       // 13 days
+  ];
+  assert.deepEqual(fmt.contractsDue(contracts, today).map((c) => [c.name, c.daysLeft]),
+    [['Hospital', 0], ['ABC School', 7]]);
+  // The button: everything ending within 30 days, still not the ended one.
+  assert.deepEqual(fmt.contractsDue(contracts, today, { all: true }).map((c) => c.name),
+    ['Hospital', 'ABC School', 'Later']);
+});
+
+test('the morning message: documents, then contracts; either alone', () => {
+  const doc = { vehicleNumber: 'KL-07-AB-1234', label: 'ഇൻഷുറൻസ്', expiry: at(2026, 11, 17), daysLeft: 5 };
+  const contract = { name: 'ABC School', endDate: at(2026, 11, 19), daysLeft: 7 };
+
+  const both = fmt.documentsMessage([doc], { contracts: [contract] });
+  assert.ok(both.startsWith('🚗 <b>രേഖകൾ ശ്രദ്ധിക്കണം</b>'));
+  assert.ok(both.includes(
+    '\n\n📄 <b>കരാറുകൾ തീരാറായി</b>\n\n• <b>ABC School</b>: 7 ദിവസത്തിൽ തീരും (19/11/2026)'
+  ));
+
+  const onlyContract = fmt.documentsMessage([], { contracts: [{ ...contract, daysLeft: 1 }] });
+  assert.match(onlyContract, /^📄 /);
+  assert.ok(onlyContract.includes('ABC School</b>: നാളെ തീരും'));
+  assert.doesNotMatch(onlyContract, /🚗/);
+  assert.match(fmt.documentsMessage([], { contracts: [{ ...contract, daysLeft: 0 }] }), /ഇന്ന് തീരും/);
+});
+
+test('evening: the day in figures, or a nudge when nothing was entered', () => {
+  const now = at(2026, 11, 12, 20, 30);
+  const day = (today, profit = 50000) => ({ today, summary: { profit } });
+
+  const busy = fmt.eveningMessage(day({
+    tripCount: 3, contractTripCount: 2, savariTripCount: 1, revenue: 6200,
+    driverSalary: 600, otherExpense: 200, totalExpense: 800, profit: 5400
+  }), now);
+  assert.equal(busy, [
+    '📋 <b>ഇന്ന് (12/11)</b>',
+    '',
+    'ട്രിപ്പ്: 3 (കരാർ 2, സവാരി 1)',
+    'വരുമാനം: ₹6,200',
+    'ചെലവ്: ₹800 (ശമ്പളം ₹600, മറ്റ് ₹200)',
+    '<b>ലാഭം: ₹5,400</b>',
+    '',
+    'ഈ മാസം ഇതുവരെ: ലാഭം ₹50,000'
+  ].join('\n'));
+
+  const salaryOnly = fmt.eveningMessage(day({
+    tripCount: 1, contractTripCount: 1, savariTripCount: 0, revenue: 1000,
+    driverSalary: 750, otherExpense: 0, totalExpense: 750, profit: 250
+  }, -3000), now);
+  assert.ok(salaryOnly.includes('ചെലവ്: ₹750 (ഡ്രൈവർ ശമ്പളം)'));
+  assert.match(salaryOnly, /ഈ മാസം ഇതുവരെ: നഷ്ടം ₹3,000$/);
+
+  const idle = fmt.eveningMessage(day({ tripCount: 0, otherExpense: 0 }), now);
+  assert.equal(idle, '❓ <b>ഇന്ന് (12/11) ട്രിപ്പ് ഒന്നും ചേർത്തിട്ടില്ല.</b>\nഓടിയെങ്കിൽ ആപ്പിൽ ചേർക്കാൻ മറക്കല്ലേ.');
+
+  const idleWithFuel = fmt.eveningMessage(day({ tripCount: 0, otherExpense: 1500 }), now);
+  assert.match(idleWithFuel, /ഇന്നത്തെ ചെലവ്: ₹1,500$/);
+});
+
+test('renew: one button per document, data within Telegram\'s 64 bytes', () => {
+  const vehicleId = '0123456789abcdef01234567';
+  const due = fmt.documentsDue([{
+    _id: vehicleId,
+    vehicleNumber: 'KL-07-AB-1234',
+    insuranceExpiry: at(2026, 11, 17, 0),
+    taxDate: at(2026, 11, 10, 0),
+    testDate: at(2027, 6, 1, 0),
+    pollutionDate: at(2027, 6, 1, 0)
+  }], at(2026, 11, 12, 9));
+
+  const rows = fmt.renewKeyboard(due).inline_keyboard;
+  assert.deepEqual(rows.map((r) => r[0].text), [
+    '🔄 KL-07-AB-1234 ടാക്സ് പുതുക്കി',
+    '🔄 KL-07-AB-1234 ഇൻഷുറൻസ് പുതുക്കി'
+  ]);
+  for (const [button] of rows) assert.ok(Buffer.byteLength(button.callback_data) <= 64);
+  assert.deepEqual(fmt.parseRenewCallback(rows[0][0].callback_data),
+    { action: 'ask', field: 'taxDate', vehicleId });
+  assert.equal(fmt.renewKeyboard([]), null);
+
+  const confirm = fmt.renewConfirmKeyboard('0a1b2c3d').inline_keyboard.flat();
+  assert.deepEqual(confirm.map((b) => fmt.parseRenewCallback(b.callback_data).action),
+    ['yes', 'change', 'cancel']);
+  assert.equal(fmt.parseRenewCallback('ren:x:0123456789abcdef01234567'), null);
+  assert.equal(fmt.parseRenewCallback('rny:not-hex!'), null);
+  assert.equal(fmt.parseRenewCallback('pay:a:0123456789abcdef01234567'), null);
+});
+
+test('renew: the new date as he would type it', () => {
+  const today = at(2026, 11, 12, 9);
+  const ok = (text) => {
+    const { date, error } = fmt.parseExpiryDate(text, today);
+    assert.equal(error, undefined, text);
+    return fmt.date(date);
+  };
+  assert.equal(ok('17/11/2027'), '17/11/2027');
+  assert.equal(ok('17-11-27'), '17/11/2027');
+  assert.equal(ok('1.2.2027'), '01/02/2027');
+  assert.equal(ok(' 17 11 2027 '), '17/11/2027');
+  assert.equal(ok('13/11/2026'), '13/11/2026'); // tomorrow
+
+  const error = (text) => fmt.parseExpiryDate(text, today).error;
+  assert.match(error('hello'), /മനസ്സിലായില്ല/);
+  assert.match(error('2027-11-17'), /മനസ്സിലായില്ല/);
+  assert.match(error('31/02/2027'), /തീയതി ഇല്ല/);
+  assert.match(error('12/11/2026'), /കഴിഞ്ഞുപോയി/); // today: not a renewal
+  assert.match(error('17/11/2025'), /കഴിഞ്ഞുപോയി/);
+  assert.match(error('17/11/2097'), /വർഷം/);
+
+  assert.equal(fmt.longDate(at(2027, 11, 17)), '17 നവംബർ 2027');
+  assert.ok(fmt.renewConfirmText('KL-07-AB-1234', 'insuranceExpiry', at(2027, 11, 17))
+    .includes('<b>17 നവംബർ 2027</b> (17/11/2027)'));
+  assert.ok(fmt.renewDoneText('KL-07-AB-1234', 'taxDate', at(2027, 11, 17), 'Girish')
+    .startsWith('✅ <b>KL-07-AB-1234 ടാക്സ്</b> 17/11/2027 വരെ പുതുക്കി · Girish'));
+  assert.ok(fmt.isCancelWord('വേണ്ട'));
+  assert.ok(fmt.isCancelWord('Cancel'));
+  assert.ok(!fmt.isCancelWord('17/11/2027'));
+});
+
+test('driver statement: totals, paid and owed, each trip', () => {
+  const [group] = fmt.groupByDriver([
+    trip({ tripDate: at(2026, 10, 2), driverSalary: 750, driverSalaryPaid: true }),
+    trip({ tripDate: at(2026, 10, 5), driverSalary: 750, driverSalaryPaid: true }),
+    trip({ tripType: 'savari', clientName: 'Ramesh', distance: 40, tripDate: at(2026, 10, 30),
+      driverSalary: 500, driverSalaryPaid: false })
+  ]);
+
+  assert.equal(fmt.driverStatement(group, 2026, 10), [
+    '🧾 <b>Girish</b> · ഒക്ടോബർ 2026',
+    '',
+    'ട്രിപ്പ്: 3',
+    'ആകെ ശമ്പളം: ₹2,000',
+    'കൊടുത്തത്: ₹1,500',
+    '<b>ബാക്കി: ₹500</b>',
+    '',
+    '• 02/10 · ABC School (കരാർ) — ₹750',
+    '• 05/10 · ABC School (കരാർ) — ₹750',
+    '• 30/10 · Ramesh (സവാരി, 40 കി.മീ) — ₹500 <i>(ബാക്കി)</i>'
+  ].join('\n'));
+
+  assert.equal(fmt.driverStatementShort(group, 2026, 10),
+    'Girish · ഒക്ടോബർ 2026\nട്രിപ്പ്: 3\nആകെ ശമ്പളം: ₹2,000\nകൊടുത്തത്: ₹1,500\nബാക്കി: ₹500');
+
+  const [allPaid] = fmt.groupByDriver([trip({ driverSalaryPaid: true })]);
+  assert.ok(fmt.driverStatement(allPaid, 2026, 11).includes('ബാക്കി: ഇല്ല ✅'));
+
+  const many = [];
+  for (let i = 0; i < 45; i++) many.push(trip({ driverSalary: 100 }));
+  const long = fmt.driverStatement(fmt.groupByDriver(many)[0], 2026, 11);
+  assert.ok(long.endsWith('• …കൂടാതെ 5 ട്രിപ്പ്'));
+  assert.ok(long.length < 4096, 'fits one Telegram message');
+});
+
+test('WhatsApp button to the driver, from a stored phone number', () => {
+  assert.equal(fmt.whatsAppNumber('98765 43210'), '919876543210');
+  assert.equal(fmt.whatsAppNumber('09876543210'), '919876543210');
+  assert.equal(fmt.whatsAppNumber('+91 98765 43210'), '919876543210');
+  assert.equal(fmt.whatsAppNumber('12345'), null);
+  assert.equal(fmt.whatsAppNumber(undefined), null);
+
+  const button = fmt.whatsAppKeyboard('9876543210', 'ബാക്കി: ₹500').inline_keyboard[0][0];
+  assert.equal(button.text, 'WhatsApp-ൽ ഡ്രൈവർക്ക് അയക്കുക');
+  const url = new URL(button.url);
+  assert.equal(url.origin + url.pathname, 'https://wa.me/919876543210');
+  assert.equal(url.searchParams.get('text'), 'ബാക്കി: ₹500');
+  assert.equal(fmt.whatsAppKeyboard('', 'x'), null);
 });

@@ -14,10 +14,12 @@ const telegramSettingsSchema = new mongoose.Schema({
   documents: { type: Boolean, default: true },
   salary: { type: Boolean, default: true },
   monthly: { type: Boolean, default: true },
+  evening: { type: Boolean, default: true },
   sent: {
     documents: { type: String, default: null }, // "2026-11-12"
     salary: { type: String, default: null },    // "2026-11-12"
-    monthly: { type: String, default: null }    // "2026-11"
+    monthly: { type: String, default: null },   // "2026-11"
+    evening: { type: String, default: null }    // "2026-11-12"
   }
 }, {
   timestamps: true

@@ -20,6 +20,20 @@ const telegramLinkSchema = new mongoose.Schema({
     type: String,
     trim: true,
     default: ''
+  },
+  // A document renewal started from a "പുതുക്കി" button, waiting for its new
+  // date (then for "yes"). The nonce ties the confirm buttons to this one
+  // renewal, so an old message's buttons can't apply a newer date.
+  pending: {
+    type: {
+      _id: false,
+      vehicleId: mongoose.Schema.Types.ObjectId,
+      field: String,
+      date: Date,
+      nonce: String,
+      expiresAt: Date
+    },
+    default: null
   }
 }, {
   timestamps: true

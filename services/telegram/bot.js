@@ -1,6 +1,8 @@
 // The Yathra Rekha Telegram bot: linking chats to an account, the scheduled
-// messages (documents 9 AM, salary 7 PM, last month's report on the 1st),
-// the "paid" button on salary messages, and the quick-ask buttons.
+// messages (documents and contracts 9 AM, salary 7 PM, the day at 8:30 PM,
+// last month's report, bills and driver statements on the 1st), the "paid"
+// button on salary messages, renewing a document from its reminder, and the
+// quick-ask buttons.
 //
 // Wording lives in ./format.js; this file only reads and writes data and
 // talks to Telegram.
@@ -14,9 +16,12 @@ const TelegramSettings = require('../../models/TelegramSettings');
 const SalaryNotice = require('../../models/SalaryNotice');
 const Trip = require('../../models/Trip');
 const Vehicle = require('../../models/Vehicle');
+const Contract = require('../../models/Contract');
+const Driver = require('../../models/Driver');
 const { buildDashboard } = require('../businessSummary');
 const { contractBillPdf, contractsWithTrips } = require('../contractBillPdf');
 const { businessNow } = require('../../utils/clock');
+const { normaliseName } = require('../../utils/names');
 
 const LINK_CODE_MINUTES = 15;
 
@@ -101,16 +106,155 @@ async function linkChat(code, message) {
 
 // ---------------------------------------------------------------- documents
 
+/** Vehicle documents and contracts ending, in one message. */
 async function sendDocuments(userId, chats, { all = false, now = businessNow() } = {}) {
-  const vehicles = await Vehicle.find({ userId })
-    .select('vehicleNumber insuranceExpiry taxDate testDate pollutionDate')
+  const [vehicles, contracts] = await Promise.all([
+    Vehicle.find({ userId })
+      .select('vehicleNumber insuranceExpiry taxDate testDate pollutionDate')
+      .setOptions({ excludeClassification: true })
+      .lean(),
+    Contract.find({ userId }).select('contractName contractEndDate').lean()
+  ]);
+  const due = fmt.documentsDue(vehicles, now, { all });
+  const contractsDue = fmt.contractsDue(contracts, now, { all });
+  // The morning message only when something is due; the button always answers.
+  if (!all && due.length === 0 && contractsDue.length === 0) return 0;
+  const keyboard = fmt.renewKeyboard(due);
+  await sendToChats(
+    chats,
+    fmt.documentsMessage(due, { all, contracts: contractsDue }),
+    keyboard ? { reply_markup: keyboard } : undefined
+  );
+  return due.length + contractsDue.length;
+}
+
+// ------------------------------------------------------------------- renew
+//
+// "പുതുക്കി" on a document → the bot asks for the new date → he types it →
+// the bot repeats it spelt out and asks "ശരിയാണോ?" → on yes the vehicle is
+// updated and everyone linked is told. Waiting state lives on the chat's
+// TelegramLink (pending) for 30 minutes.
+
+const RENEW_MINUTES = 30;
+
+const renewWaiting = (link) =>
+  Boolean(link.pending && link.pending.expiresAt && new Date(link.pending.expiresAt) > new Date());
+
+const askForDate = (chatId, vehicleNumber, field) => safeSend(
+  chatId,
+  fmt.renewPrompt(vehicleNumber, field),
+  { reply_markup: { force_reply: true, input_field_placeholder: 'ഉദാ: 17/11/2027' } }
+);
+
+async function startRenewal(link, chatId, { field, vehicleId }) {
+  const vehicle = await Vehicle.findOne({ _id: vehicleId, userId: link.userId })
+    .select('vehicleNumber')
     .setOptions({ excludeClassification: true })
     .lean();
-  const due = fmt.documentsDue(vehicles, now, { all });
-  // The morning message only when something is due; the button always answers.
-  if (!all && due.length === 0) return 0;
-  await sendToChats(chats, fmt.documentsMessage(due, { all }));
-  return due.length;
+  if (!vehicle) return 'ഈ വാഹനം ഇപ്പോൾ ഇല്ല';
+
+  await TelegramLink.updateOne({ _id: link._id }, {
+    $set: {
+      pending: {
+        vehicleId,
+        field,
+        date: null,
+        nonce: crypto.randomBytes(4).toString('hex'),
+        expiresAt: new Date(Date.now() + RENEW_MINUTES * 60 * 1000)
+      }
+    }
+  });
+  await askForDate(chatId, vehicle.vehicleNumber, field);
+  return null;
+}
+
+/** He typed something while a renewal waits for its date. */
+async function renewalReply(link, chatId, text) {
+  if (fmt.isCancelWord(text)) {
+    await TelegramLink.updateOne({ _id: link._id }, { $set: { pending: null } });
+    return safeSend(chatId, fmt.RENEW_CANCELLED, { reply_markup: fmt.QUICK_KEYBOARD });
+  }
+
+  const pending = link.pending;
+  const vehicle = await Vehicle.findOne({ _id: pending.vehicleId, userId: link.userId })
+    .select('vehicleNumber')
+    .setOptions({ excludeClassification: true })
+    .lean();
+  if (!vehicle) {
+    await TelegramLink.updateOne({ _id: link._id }, { $set: { pending: null } });
+    return safeSend(chatId, 'ഈ വാഹനം ഇപ്പോൾ ഇല്ല.', { reply_markup: fmt.QUICK_KEYBOARD });
+  }
+
+  const parsed = fmt.parseExpiryDate(text, businessNow());
+  if (parsed.error) {
+    return safeSend(chatId, `⚠️ ${parsed.error}`, {
+      reply_markup: { force_reply: true, input_field_placeholder: 'ഉദാ: 17/11/2027' }
+    });
+  }
+
+  await TelegramLink.updateOne({ _id: link._id }, { $set: { 'pending.date': parsed.date } });
+  return safeSend(chatId, fmt.renewConfirmText(vehicle.vehicleNumber, pending.field, parsed.date), {
+    reply_markup: fmt.renewConfirmKeyboard(pending.nonce)
+  });
+}
+
+/** The confirm buttons: yes (save), change (ask again), cancel. */
+async function answerRenewal(link, query, { action, nonce }) {
+  const chatId = query.message.chat.id;
+  const messageId = query.message.message_id;
+  const current = await TelegramLink.findById(link._id).lean();
+  const pending = current?.pending;
+
+  if (!pending || pending.nonce !== nonce || !renewWaiting(current)) {
+    await safeEdit(chatId, messageId, fmt.RENEW_STALE);
+    return fmt.RENEW_STALE;
+  }
+
+  if (action === 'cancel') {
+    await TelegramLink.updateOne({ _id: link._id }, { $set: { pending: null } });
+    await safeEdit(chatId, messageId, fmt.RENEW_CANCELLED);
+    return null;
+  }
+
+  const vehicle = await Vehicle.findOne({ _id: pending.vehicleId, userId: link.userId })
+    .select('vehicleNumber')
+    .setOptions({ excludeClassification: true })
+    .lean();
+  if (!vehicle) {
+    await TelegramLink.updateOne({ _id: link._id }, { $set: { pending: null } });
+    await safeEdit(chatId, messageId, 'ഈ വാഹനം ഇപ്പോൾ ഇല്ല.');
+    return null;
+  }
+
+  if (action === 'change' || !pending.date) {
+    await TelegramLink.updateOne({ _id: link._id }, { $set: { 'pending.date': null } });
+    await safeEdit(chatId, messageId, '✏️ ശരി, ശരിയായ തീയതി വീണ്ടും അയക്കുക.');
+    await askForDate(chatId, vehicle.vehicleNumber, pending.field);
+    return null;
+  }
+
+  if (!Object.values(fmt.FIELD_CODES).includes(pending.field)) {
+    return 'ഇത് ഇപ്പോൾ ചെയ്യാനാവില്ല';
+  }
+
+  // Yes. Claimed by clearing the pending state, so a double tap saves once.
+  const claimed = await TelegramLink.findOneAndUpdate(
+    { _id: link._id, 'pending.nonce': nonce },
+    { $set: { pending: null } }
+  );
+  if (!claimed) return fmt.RENEW_STALE;
+
+  const value = new Date(pending.date);
+  await Vehicle.updateOne(
+    { _id: pending.vehicleId, userId: link.userId },
+    { $set: { [pending.field]: value } }
+  );
+
+  const done = fmt.renewDoneText(vehicle.vehicleNumber, pending.field, value, fmt.chatName(query.from));
+  await safeEdit(chatId, messageId, done);
+  const others = (await chatsOf(link.userId)).filter((c) => c.chatId !== chatId);
+  if (others.length > 0) await sendToChats(others, done);
+  return 'പുതുക്കി';
 }
 
 // ------------------------------------------------------------------- salary
@@ -235,10 +379,24 @@ async function handleCallback(query) {
   const answer = (text) => api.answerCallbackQuery(query.id, text).catch((e) =>
     console.error('Telegram answer failed:', e.message));
 
-  const parsed = fmt.parsePayCallback(query.data);
   const chatId = query.message?.chat?.id;
   const messageId = query.message?.message_id;
   const link = chatId ? await TelegramLink.findOne({ chatId }).lean() : null;
+
+  const renewal = fmt.parseRenewCallback(query.data);
+  if (renewal && link) {
+    try {
+      const reply = renewal.action === 'ask'
+        ? await startRenewal(link, chatId, renewal)
+        : await answerRenewal(link, query, renewal);
+      return answer(reply || undefined);
+    } catch (error) {
+      console.error('Renewal failed:', error);
+      return answer('നടന്നില്ല. കുറച്ച് കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക.');
+    }
+  }
+
+  const parsed = fmt.parsePayCallback(query.data);
   if (!parsed || !link) return answer('ഇത് ഇപ്പോൾ ചെയ്യാനാവില്ല');
 
   const notice = await SalaryNotice.findOne({ _id: parsed.noticeId, userId: link.userId }).lean();
@@ -281,7 +439,7 @@ async function sendMonthlyReport(userId, chats, now = businessNow()) {
   const year = now.getMonth() === 0 ? now.getFullYear() - 1 : now.getFullYear();
   const month = now.getMonth() === 0 ? 12 : now.getMonth(); // last month, 1-12
 
-  const dashboard = await buildDashboard(userId, { year, month });
+  const dashboard = await buildDashboard(userId, { year, month }, { now });
   const s = dashboard.summary;
   if (s.tripCount === 0 && s.otherExpense === 0) return; // Nothing happened.
   await sendToChats(chats, fmt.monthMessage(dashboard));
@@ -303,6 +461,59 @@ async function sendMonthlyReport(userId, chats, now = businessNow()) {
       }
     }
   }
+
+  await sendDriverStatements(userId, chats, { year, month, start, end });
+}
+
+/**
+ * Each driver's month, to forward to them: one message per driver, with a
+ * button that opens WhatsApp to that driver with the summary filled in.
+ */
+async function sendDriverStatements(userId, chats, { year, month, start, end }) {
+  const [trips, drivers] = await Promise.all([
+    Trip.find({ userId, tripDate: { $gte: start, $lte: end } })
+      .select('tripType clientName driverId driverName driverSalary driverSalaryPaid tripDate distance')
+      .lean(),
+    Driver.find({ userId }).select('name phone').lean()
+  ]);
+  const groups = fmt.groupByDriver(trips);
+  if (groups.length === 0) return 0;
+
+  const byId = new Map(drivers.map((d) => [String(d._id), d]));
+  const byName = new Map(drivers.map((d) => [normaliseName(d.name), d]));
+
+  await sendToChats(chats, fmt.statementsHeader(year, month, groups.length));
+  for (const group of groups) {
+    const driver = group.driverId
+      ? byId.get(String(group.driverId))
+      : byName.get(normaliseName(group.driverName));
+    const text = fmt.driverStatement(group, year, month);
+    const keyboard = fmt.whatsAppKeyboard(driver?.phone, fmt.driverStatementShort(group, year, month));
+
+    for (const chat of chats) {
+      if (!keyboard) {
+        await safeSend(chat.chatId, text);
+        continue;
+      }
+      try {
+        await api.sendMessage(chat.chatId, text, { reply_markup: keyboard });
+      } catch (error) {
+        // Telegram refused the button (a link it won't take): the statement
+        // still matters more than the shortcut.
+        console.error('Statement with WhatsApp button failed:', error.message);
+        await safeSend(chat.chatId, text);
+      }
+    }
+  }
+  return groups.length;
+}
+
+// ------------------------------------------------------------------ evening
+
+/** The day's figures at 8:30 PM, or a nudge when no trip was entered. */
+async function sendEvening(userId, chats, now = businessNow()) {
+  const dashboard = await buildDashboard(userId, {}, { now });
+  await sendToChats(chats, fmt.eveningMessage(dashboard, now));
 }
 
 // ---------------------------------------------------------------- incoming
@@ -326,6 +537,11 @@ async function handleMessage(message) {
     await TelegramLink.deleteOne({ chatId });
     return safeSend(chatId, fmt.UNLINKED, { reply_markup: { remove_keyboard: true } });
   }
+
+  const isButton = Object.values(fmt.BUTTONS).includes(text) || text.startsWith('/');
+  if (!isButton && renewWaiting(link)) return renewalReply(link, chatId, text);
+  // A quick button while a renewal waits: he moved on, so drop it.
+  if (link.pending) await TelegramLink.updateOne({ _id: link._id }, { $set: { pending: null } });
 
   const chats = [link];
   if (text === fmt.BUTTONS.month || text === '/month') return sendThisMonth(link.userId, chats);
@@ -351,7 +567,8 @@ async function handleUpdate(update) {
 const JOBS = {
   documents: (userId, chats, now) => sendDocuments(userId, chats, { now }),
   salary: (userId, chats, now) => sendSalary(userId, chats, { scheduled: true, now }),
-  monthly: (userId, chats, now) => sendMonthlyReport(userId, chats, now)
+  monthly: (userId, chats, now) => sendMonthlyReport(userId, chats, now),
+  evening: (userId, chats, now) => sendEvening(userId, chats, now)
 };
 
 let running = false;
@@ -415,14 +632,15 @@ async function status(userId) {
     settings: {
       documents: settings?.documents !== false,
       salary: settings?.salary !== false,
-      monthly: settings?.monthly !== false
+      monthly: settings?.monthly !== false,
+      evening: settings?.evening !== false
     }
   };
 }
 
 async function updateSettings(userId, changes) {
   const $set = {};
-  for (const key of ['documents', 'salary', 'monthly']) {
+  for (const key of ['documents', 'salary', 'monthly', 'evening']) {
     if (typeof changes[key] === 'boolean') $set[key] = changes[key];
   }
   await TelegramSettings.updateOne({ userId }, { $set, $setOnInsert: { userId } }, { upsert: true });

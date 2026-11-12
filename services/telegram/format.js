@@ -68,10 +68,14 @@ function daysBetween(today, target) {
 
 // ---------------------------------------------------------------- schedule
 
+/** When the evening summary goes: 8:30 PM, after the day's trips are in. */
+const EVENING_MINUTES = 20 * 60 + 30;
+
 /**
  * Which scheduled messages are due at [now] (Kerala time), given what was
- * already sent. The same as the app's: documents and the monthly report from
- * 9 AM, salary from 7 PM; each once a day (the report once a month).
+ * already sent: documents and the monthly report from 9 AM, salary from
+ * 7 PM, the evening summary from 8:30 PM; each once a day (the report once
+ * a month).
  */
 function dueJobs(now, settings) {
   const sent = settings.sent || {};
@@ -86,6 +90,10 @@ function dueJobs(now, settings) {
   }
   if (settings.salary !== false && now.getHours() >= 19 && sent.salary !== today) {
     jobs.push({ job: 'salary', key: today });
+  }
+  const minutes = now.getHours() * 60 + now.getMinutes();
+  if (settings.evening !== false && minutes >= EVENING_MINUTES && sent.evening !== today) {
+    jobs.push({ job: 'evening', key: today });
   }
   return jobs;
 }
@@ -122,28 +130,175 @@ function documentsDue(vehicles, today, { all = false } = {}) {
       const daysLeft = daysBetween(today, expiry);
       const wanted = all ? daysLeft <= 30 : remindsOn(daysLeft);
       if (wanted) {
-        due.push({ vehicleNumber: vehicle.vehicleNumber, label, expiry, daysLeft });
+        due.push({
+          vehicleId: vehicle._id ? String(vehicle._id) : null,
+          vehicleNumber: vehicle.vehicleNumber,
+          field,
+          label,
+          expiry,
+          daysLeft
+        });
       }
     }
   }
   return due.sort((a, b) => a.daysLeft - b.daysLeft);
 }
 
-function documentsMessage(due, { all = false } = {}) {
-  if (due.length === 0) {
-    return '✅ <b>രേഖകൾ</b>\nഅടുത്ത 30 ദിവസത്തിൽ ഒരു രേഖയും തീരുന്നില്ല.';
+/**
+ * Whether a contract [daysLeft] days from its end is mentioned that morning:
+ * 30 days before, then daily in the last week up to the day it ends. Not
+ * after: unlike an insurance, a contract that ended may simply be over.
+ */
+const contractRemindsOn = (daysLeft) => daysLeft === 30 || (daysLeft >= 0 && daysLeft <= 7);
+
+/** Contracts to mention on [today]'s morning, soonest first. */
+function contractsDue(contracts, today, { all = false } = {}) {
+  const due = [];
+  for (const contract of contracts) {
+    if (!contract.contractEndDate) continue;
+    const endDate = new Date(contract.contractEndDate);
+    const daysLeft = daysBetween(today, endDate);
+    const wanted = all ? daysLeft >= 0 && daysLeft <= 30 : contractRemindsOn(daysLeft);
+    if (wanted) due.push({ name: contract.contractName, endDate, daysLeft });
   }
-  const lines = due.map((d) =>
-    `• <b>${escapeHtml(d.vehicleNumber)}</b> · ${d.label}: ${dueWords(d.daysLeft)} (${date(d.expiry)})`
-  );
-  return [
-    all ? '🚗 <b>രേഖകൾ: 30 ദിവസത്തിനുള്ളിൽ</b>' : '🚗 <b>രേഖകൾ ശ്രദ്ധിക്കണം</b>',
-    '',
-    ...lines,
-    '',
-    'പുതുക്കിയാൽ ആപ്പിൽ വാഹനത്തിന്റെ പുതിയ തീയതി ചേർക്കുക.'
-  ].join('\n');
+  return due.sort((a, b) => a.daysLeft - b.daysLeft);
 }
+
+function contractWords(daysLeft) {
+  if (daysLeft > 1) return `${daysLeft} ദിവസത്തിൽ തീരും`;
+  if (daysLeft === 1) return 'നാളെ തീരും';
+  return 'ഇന്ന് തീരും';
+}
+
+/**
+ * The morning message: vehicle documents, then contracts ending. [all] for
+ * the "രേഖകൾ" button, which lists everything within 30 days.
+ */
+function documentsMessage(due, { all = false, contracts = [] } = {}) {
+  if (due.length === 0 && contracts.length === 0) {
+    return '✅ <b>രേഖകൾ</b>\nഅടുത്ത 30 ദിവസത്തിൽ ഒരു രേഖയും കരാറും തീരുന്നില്ല.';
+  }
+  const sections = [];
+  if (due.length > 0) {
+    sections.push([
+      all ? '🚗 <b>രേഖകൾ: 30 ദിവസത്തിനുള്ളിൽ</b>' : '🚗 <b>രേഖകൾ ശ്രദ്ധിക്കണം</b>',
+      '',
+      ...due.map((d) =>
+        `• <b>${escapeHtml(d.vehicleNumber)}</b> · ${d.label}: ${dueWords(d.daysLeft)} (${date(d.expiry)})`
+      ),
+      '',
+      'പുതുക്കിയാൽ താഴെയുള്ള "പുതുക്കി" ബട്ടൺ അമർത്തി പുതിയ തീയതി അയക്കുക.'
+    ].join('\n'));
+  }
+  if (contracts.length > 0) {
+    sections.push([
+      '📄 <b>കരാറുകൾ തീരാറായി</b>',
+      '',
+      ...contracts.map((c) =>
+        `• <b>${escapeHtml(c.name)}</b>: ${contractWords(c.daysLeft)} (${date(c.endDate)})`
+      ),
+      '',
+      'തുടരുമെങ്കിൽ ക്ലയന്റുമായി സംസാരിച്ച് ആപ്പിൽ കരാറിന്റെ പുതിയ അവസാന തീയതി ചേർക്കുക.'
+    ].join('\n'));
+  }
+  return sections.join('\n\n');
+}
+
+// ------------------------------------------------------------------ renew
+
+/** One letter per document in button data (Telegram allows 64 bytes). */
+const FIELD_CODES = { i: 'insuranceExpiry', t: 'taxDate', f: 'testDate', p: 'pollutionDate' };
+const CODE_FOR_FIELD = Object.fromEntries(Object.entries(FIELD_CODES).map(([c, f]) => [f, c]));
+const documentLabel = (field) => DOCUMENTS[field] || '';
+
+/** Longest a renewal may run: anything past this is a typo in the year. */
+const MAX_RENEWAL_YEARS = 15;
+
+/** A "പുതുക്കി" button per document in the morning message (at most 20). */
+function renewKeyboard(due) {
+  const rows = due
+    .filter((d) => d.vehicleId && CODE_FOR_FIELD[d.field])
+    .slice(0, 20)
+    .map((d) => [{
+      text: `🔄 ${d.vehicleNumber} ${d.label} പുതുക്കി`,
+      callback_data: `ren:${CODE_FOR_FIELD[d.field]}:${d.vehicleId}`
+    }]);
+  return rows.length > 0 ? { inline_keyboard: rows } : null;
+}
+
+/**
+ * Renewal buttons: "ren:<doc>:<vehicleId>" starts one; "rny:", "rnn:" and
+ * "rnc:" + nonce answer the confirmation (yes, change the date, cancel).
+ */
+function parseRenewCallback(data) {
+  const text = String(data || '');
+  const start = /^ren:([itfp]):([a-f0-9]{24})$/.exec(text);
+  if (start) return { action: 'ask', field: FIELD_CODES[start[1]], vehicleId: start[2] };
+  const answer = /^rn([ync]):([a-f0-9]{8})$/.exec(text);
+  if (answer) {
+    return { action: { y: 'yes', n: 'change', c: 'cancel' }[answer[1]], nonce: answer[2] };
+  }
+  return null;
+}
+
+/**
+ * A new expiry date as he would type it: 17/11/2027, 17-11-27, 17.11.2027
+ * or 17 11 2027. It must be a real date after [today], and not absurdly far.
+ * Gives { date } (local midnight, the stored convention) or { error }.
+ */
+function parseExpiryDate(input, today) {
+  const match = /^(\d{1,2})\s*[/.\- ]\s*(\d{1,2})\s*[/.\- ]\s*(\d{4}|\d{2})$/.exec(String(input || '').trim());
+  if (!match) {
+    return { error: 'തീയതി മനസ്സിലായില്ല. ഇങ്ങനെ അയക്കുക: 17/11/2027' };
+  }
+  const day = Number(match[1]);
+  const month = Number(match[2]);
+  const year = match[3].length === 2 ? 2000 + Number(match[3]) : Number(match[3]);
+  const value = new Date(year, month - 1, day);
+  if (value.getFullYear() !== year || value.getMonth() !== month - 1 || value.getDate() !== day) {
+    return { error: `${match[1]}/${match[2]}/${match[3]} എന്നൊരു തീയതി ഇല്ല. ദിവസവും മാസവും നോക്കുക.` };
+  }
+  const days = daysBetween(today, value);
+  if (days <= 0) {
+    return { error: 'ഈ തീയതി കഴിഞ്ഞുപോയി. പുതുക്കിയ ശേഷം രേഖ തീരുന്ന പുതിയ തീയതി അയക്കുക.' };
+  }
+  if (days > MAX_RENEWAL_YEARS * 366) {
+    return { error: 'തീയതി ശരിയാണോ? വർഷം ഒന്ന് നോക്കുക.' };
+  }
+  return { date: value };
+}
+
+/** "17 നവംബർ 2027", spelt out so a wrong month is noticed. */
+const longDate = (d) => `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+
+const renewPrompt = (vehicleNumber, field) =>
+  `🔄 <b>${escapeHtml(vehicleNumber)} ${documentLabel(field)}</b>\n\n` +
+  'പുതുക്കിയ ശേഷം രേഖ തീരുന്ന പുതിയ തീയതി അയക്കുക.\nഉദാ: <b>17/11/2027</b>\n\n' +
+  'വേണ്ടെങ്കിൽ "വേണ്ട" എന്ന് അയക്കുക.';
+
+const renewConfirmText = (vehicleNumber, field, value) =>
+  `🔄 <b>${escapeHtml(vehicleNumber)} ${documentLabel(field)}</b>\n\n` +
+  `പുതിയ അവസാന തീയതി: <b>${longDate(value)}</b> (${date(value)})\nശരിയാണോ?`;
+
+const renewConfirmKeyboard = (nonce) => ({
+  inline_keyboard: [[
+    { text: 'ഉവ്വ്, ശരിയാണ്', callback_data: `rny:${nonce}` },
+    { text: 'മാറ്റണം', callback_data: `rnn:${nonce}` }
+  ], [
+    { text: 'വേണ്ട', callback_data: `rnc:${nonce}` }
+  ]]
+});
+
+const renewDoneText = (vehicleNumber, field, value, by) =>
+  `✅ <b>${escapeHtml(vehicleNumber)} ${documentLabel(field)}</b> ${date(value)} വരെ പുതുക്കി` +
+  (by ? ` · ${escapeHtml(by)}` : '') +
+  '\nഇനി അതിന്റെ ഓർമ്മപ്പെടുത്തൽ ആ തീയതിക്ക് മുമ്പ് മാത്രം.';
+
+const RENEW_CANCELLED = 'ശരി, ഒന്നും മാറ്റിയില്ല.';
+const RENEW_STALE = 'ഇത് പഴയതാണ്. രേഖയുടെ "പുതുക്കി" ബട്ടൺ വീണ്ടും അമർത്തുക.';
+
+/** Words that cancel a renewal waiting for its date. */
+const isCancelWord = (text) => /^(വേണ്ട|cancel|\/cancel|no)$/i.test(String(text || '').trim());
 
 // ------------------------------------------------------------------ salary
 
@@ -309,14 +464,138 @@ function monthMessage(dashboard, { soFar = false } = {}) {
   return lines.join('\n');
 }
 
+// --------------------------------------------------------- driver statement
+
+/** Most trips listed in a statement; the rest are counted in one line. */
+const MAX_STATEMENT_LINES = 40;
+
+/**
+ * A driver's month for the owner to forward: trips, salary, paid, still owed,
+ * and every trip with its salary, unpaid ones marked. [group] is one entry of
+ * groupByDriver over all the month's trips, paid or not.
+ */
+function driverStatement(group, year, month) {
+  const paid = group.trips
+    .filter((t) => t.driverSalaryPaid)
+    .reduce((sum, t) => sum + (t.driverSalary || 0), 0);
+  const owed = group.amount - paid;
+
+  const shown = group.trips.slice(0, MAX_STATEMENT_LINES);
+  const lines = shown.map((t) => {
+    const kind = t.tripType === 'contract'
+      ? 'കരാർ'
+      : `സവാരി${t.distance ? `, ${Math.round(t.distance)} കി.മീ` : ''}`;
+    return `• ${dayMonth(new Date(t.tripDate))} · ${escapeHtml(t.clientName || '—')} (${kind}) — ` +
+      `${money(t.driverSalary)}${t.driverSalaryPaid ? '' : ' <i>(ബാക്കി)</i>'}`;
+  });
+  if (group.trips.length > shown.length) {
+    lines.push(`• …കൂടാതെ ${group.trips.length - shown.length} ട്രിപ്പ്`);
+  }
+
+  return [
+    `🧾 <b>${escapeHtml(group.driverName)}</b> · ${monthYear(year, month)}`,
+    '',
+    `ട്രിപ്പ്: ${group.trips.length}`,
+    `ആകെ ശമ്പളം: ${money(group.amount)}`,
+    `കൊടുത്തത്: ${money(paid)}`,
+    owed > 0 ? `<b>ബാക്കി: ${money(owed)}</b>` : 'ബാക്കി: ഇല്ല ✅',
+    '',
+    ...lines
+  ].join('\n');
+}
+
+/**
+ * The same in short plain text, for WhatsApp to the driver: the summary
+ * only, as the whole message has to fit in a link.
+ */
+function driverStatementShort(group, year, month) {
+  const paid = group.trips
+    .filter((t) => t.driverSalaryPaid)
+    .reduce((sum, t) => sum + (t.driverSalary || 0), 0);
+  const owed = group.amount - paid;
+  return [
+    `${group.driverName} · ${monthYear(year, month)}`,
+    `ട്രിപ്പ്: ${group.trips.length}`,
+    `ആകെ ശമ്പളം: ${money(group.amount)}`,
+    `കൊടുത്തത്: ${money(paid)}`,
+    `ബാക്കി: ${owed > 0 ? money(owed) : 'ഇല്ല'}`
+  ].join('\n');
+}
+
+const statementsHeader = (year, month, count) =>
+  `🧾 <b>ഡ്രൈവർമാരുടെ ${monthYear(year, month)} കണക്ക്</b> (${count})\n` +
+  'ഓരോന്നിന്റെയും താഴെയുള്ള ബട്ടൺ അമർത്തി ആ ഡ്രൈവർക്ക് WhatsApp-ൽ അയക്കാം.';
+
+/**
+ * A stored phone number as WhatsApp wants it (country code, digits only),
+ * as the app's ContactActions.whatsAppNumber. Null when it can't be one.
+ */
+function whatsAppNumber(phone) {
+  let digits = String(phone || '').replace(/\D/g, '');
+  if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
+  if (digits.length === 10) return `91${digits}`;
+  if (digits.length > 10 && digits.length <= 15) return digits;
+  return null;
+}
+
+/** A button opening WhatsApp to [phone] with [text] filled in; null without a number. */
+function whatsAppKeyboard(phone, text) {
+  const number = whatsAppNumber(phone);
+  if (!number) return null;
+  return {
+    inline_keyboard: [[{
+      text: 'WhatsApp-ൽ ഡ്രൈവർക്ക് അയക്കുക',
+      url: `https://wa.me/${number}?text=${encodeURIComponent(text)}`
+    }]]
+  };
+}
+
+// ----------------------------------------------------------------- evening
+
+/**
+ * The day in one message at 8:30 PM, from buildDashboard's "today". With no
+ * trips it asks whether he forgot to enter them.
+ */
+function eveningMessage(dashboard, now) {
+  const t = dashboard.today;
+  const day = dayMonth(now);
+
+  if (!t.tripCount) {
+    const lines = [
+      `❓ <b>ഇന്ന് (${day}) ട്രിപ്പ് ഒന്നും ചേർത്തിട്ടില്ല.</b>`,
+      'ഓടിയെങ്കിൽ ആപ്പിൽ ചേർക്കാൻ മറക്കല്ലേ.'
+    ];
+    if (t.otherExpense > 0) lines.push('', `ഇന്നത്തെ ചെലവ്: ${money(t.otherExpense)}`);
+    return lines.join('\n');
+  }
+
+  const expense = t.otherExpense > 0
+    ? `${money(t.totalExpense)} (ശമ്പളം ${money(t.driverSalary)}, മറ്റ് ${money(t.otherExpense)})`
+    : `${money(t.totalExpense)} (ഡ്രൈവർ ശമ്പളം)`;
+  const month = dashboard.summary;
+  const monthWord = month.profit < 0 ? 'നഷ്ടം' : 'ലാഭം';
+
+  return [
+    `📋 <b>ഇന്ന് (${day})</b>`,
+    '',
+    `ട്രിപ്പ്: ${t.tripCount} (കരാർ ${t.contractTripCount}, സവാരി ${t.savariTripCount})`,
+    `വരുമാനം: ${money(t.revenue)}`,
+    `ചെലവ്: ${expense}`,
+    resultLine(t.profit),
+    '',
+    `ഈ മാസം ഇതുവരെ: ${monthWord} ${money(Math.abs(month.profit))}`
+  ].join('\n');
+}
+
 // ------------------------------------------------------------------- other
 
 const WELCOME = [
   '✅ <b>Yathra Rekha ബന്ധിപ്പിച്ചു!</b>',
   '',
   'ഇനി ഇവിടെ കിട്ടും:',
-  '• രാവിലെ 9 മണി: തീരാറായ വാഹന രേഖകൾ',
+  '• രാവിലെ 9 മണി: തീരാറായ വാഹന രേഖകളും കരാറുകളും',
   '• വൈകിട്ട് 7 മണി: ഡ്രൈവർമാർക്ക് കൊടുക്കാനുള്ള ശമ്പളം, ട്രിപ്പ് വിവരങ്ങളോടെ',
+  '• രാത്രി 8:30: ഇന്നത്തെ കണക്ക്',
   '• മാസം 1-ന്: കഴിഞ്ഞ മാസത്തെ റിപ്പോർട്ടും കരാർ ബില്ലുകളും',
   '',
   'താഴെയുള്ള ബട്ടണുകൾ അമർത്തി എപ്പോൾ വേണമെങ്കിലും നോക്കാം.'
@@ -368,7 +647,28 @@ module.exports = {
   remindsOn,
   dueWords,
   documentsDue,
+  contractRemindsOn,
+  contractsDue,
   documentsMessage,
+  eveningMessage,
+  FIELD_CODES,
+  renewKeyboard,
+  parseRenewCallback,
+  parseExpiryDate,
+  longDate,
+  renewPrompt,
+  renewConfirmText,
+  renewConfirmKeyboard,
+  renewDoneText,
+  RENEW_CANCELLED,
+  RENEW_STALE,
+  isCancelWord,
+  MAX_STATEMENT_LINES,
+  driverStatement,
+  driverStatementShort,
+  statementsHeader,
+  whatsAppNumber,
+  whatsAppKeyboard,
   groupByDriver,
   salaryMessage,
   salaryHeader,
