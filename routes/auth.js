@@ -8,6 +8,7 @@ const Expense = require('../models/Expense');
 const Contract = require('../models/Contract');
 const Driver = require('../models/Driver');
 const Vehicle = require('../models/Vehicle');
+const telegram = require('../services/telegram/bot');
 const authenticateToken = require('../middleware/auth');
 const attemptLimiter = require('../middleware/attemptLimiter');
 const router = express.Router();
@@ -288,6 +289,8 @@ router.delete('/delete', authenticateToken, async (req, res) => {
       const result = await Model.deleteMany({ userId });
       deleted[name] = result.deletedCount;
     }
+
+    await telegram.deleteAccountData(userId);
 
     const user = await User.findByIdAndDelete(userId);
     authenticateToken.forgetUser(userId);

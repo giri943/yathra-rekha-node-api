@@ -37,6 +37,7 @@ app.use('/api/trips', require('./routes/trips'));
 app.use('/api/drivers', require('./routes/drivers'));
 app.use('/api/expenses', require('./routes/expenses'));
 app.use('/api/reports', require('./routes/reports'));
+app.use('/api/telegram', require('./routes/telegram'));
 
 app.get('/', (req, res) => {
   res.json({ message: 'Yathra Rekha API Server' });
@@ -44,4 +45,6 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  // Telegram must know where to deliver messages and button presses.
+  require('./services/telegram/bot').registerWebhook();
 });

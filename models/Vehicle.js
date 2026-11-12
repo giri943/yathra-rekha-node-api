@@ -1,4 +1,6 @@
 const mongoose = require('mongoose');
+// Registered here because every find below populates it.
+require('./VehicleClassification');
 
 /// The comparable form of a registration number: "KL 05 a-8247" and
 /// "KL05A8247" are the same vehicle, so uniqueness is checked on this.
