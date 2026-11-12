@@ -151,14 +151,6 @@ router.post('/', auth, async (req, res) => {
       delete tripData.contractId;
     }
 
-    // Marked unpaid again: forget how it was paid, or the trip would show
-    // an old UPI reference for money still owed.
-    if (tripData.driverSalaryPaid === false) {
-      tripData.salaryPaidAt = null;
-      tripData.salaryPaidVia = null;
-      tripData.salaryPaymentRef = null;
-    }
-
     // Auto-calculate distance for all trips with km data
     if (tripData.startKm && tripData.endKm) {
       tripData.distance = tripData.endKm - tripData.startKm;
@@ -191,7 +183,7 @@ router.post('/', auth, async (req, res) => {
 // dashboard's "owed" figure, so exactly the trips the owner was shown.
 router.post('/settle-salary', auth, async (req, res) => {
   try {
-    const { driverId, driverName, until, createdBefore, via, reference } = req.body;
+    const { driverId, driverName, until, createdBefore } = req.body;
     const filter = { userId: req.user.id, driverSalaryPaid: false };
     if (driverId) {
       filter.driverId = driverId;
@@ -220,23 +212,11 @@ router.post('/settle-salary', auth, async (req, res) => {
       filter.$or = [{ createdAt: { $lte: asOf } }, { createdAt: { $exists: false } }];
     }
 
-    if (via !== undefined && !['cash', 'upi'].includes(via)) {
-      return res.status(400).json({ message: "via must be 'cash' or 'upi'" });
-    }
-    const ref = typeof reference === 'string' ? reference.trim().slice(0, 100) : '';
-
     const trips = await Trip.find(filter).select('_id driverSalary').lean();
     const amount = trips.reduce((sum, t) => sum + (t.driverSalary || 0), 0);
     const result = await Trip.updateMany(
       { _id: { $in: trips.map((t) => t._id) }, driverSalaryPaid: false },
-      {
-        $set: {
-          driverSalaryPaid: true,
-          salaryPaidAt: new Date(),
-          salaryPaidVia: via || 'cash',
-          salaryPaymentRef: ref || null
-        }
-      }
+      { $set: { driverSalaryPaid: true, salaryPaidAt: new Date() } }
     );
     res.json({ updated: result.modifiedCount, amount });
   } catch (error) {
@@ -260,7 +240,13 @@ router.put('/:id', auth, async (req, res) => {
         return res.status(400).json({ message: driverError });
       }
     }
-    
+
+    // Marked unpaid again: forget when it was paid, or the trip would show
+    // a payment date for money still owed.
+    if (tripData.driverSalaryPaid === false) {
+      tripData.salaryPaidAt = null;
+    }
+
     // Auto-calculate distance for all trips with km data
     if (tripData.startKm && tripData.endKm) {
       tripData.distance = tripData.endKm - tripData.startKm;

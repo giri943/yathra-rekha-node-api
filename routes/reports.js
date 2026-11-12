@@ -324,7 +324,7 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
       Vehicle.find({ userId }).select(
         'vehicleNumber insuranceExpiry taxDate testDate pollutionDate'
       ),
-      Driver.find({ userId }).select('name phone upiId'),
+      Driver.find({ userId }).select('name phone'),
       Trip.exists({ userId })
     ]);
 
@@ -342,18 +342,13 @@ router.get('/dashboard', authenticateToken, async (req, res) => {
     // Attach phone numbers so the owner can ring a driver straight from the
     // amount owed: by id, or by name for trips saved before driver ids. No
     // number when the driver has since been deleted.
-    // The UPI id comes along so he can pay from the same card.
     const driverById = new Map(drivers.map((d) => [String(d._id), d]));
     const driverByName = new Map(drivers.map((d) => [normaliseName(d.name), d]));
     unpaid.drivers = unpaid.drivers.map((entry) => {
       const driver = entry.driverId
         ? driverById.get(String(entry.driverId))
         : driverByName.get(normaliseName(entry.driverName));
-      return {
-        ...entry,
-        phone: driver?.phone || null,
-        upiId: driver?.upiId || null
-      };
+      return { ...entry, phone: driver?.phone || null };
     });
 
     // Documents already expired, or expiring within 30 days.

@@ -21,19 +21,6 @@ async function nameTaken(userId, name, exceptId) {
   return drivers.some((d) => String(d._id) !== String(exceptId) && sameName(d.name, name));
 }
 
-// People paste UPI ids with spaces or capitals; '' or null removes it.
-function cleanUpiId(value) {
-  if (value === undefined) return undefined;
-  if (value === null) return null;
-  const cleaned = String(value).replace(/\s+/g, '').toLowerCase();
-  return cleaned || null;
-}
-
-// An edit sends only what changed; leave the rest as it is.
-function withoutUndefined(fields) {
-  return Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined));
-}
-
 // Get all drivers
 router.get('/', auth, async (req, res) => {
   try {
@@ -47,14 +34,13 @@ router.get('/', auth, async (req, res) => {
 // Add new driver
 router.post('/', auth, async (req, res) => {
   try {
-    const { name, phone, upiId } = req.body;
+    const { name, phone } = req.body;
     if (await nameTaken(req.user.id, name)) {
       return res.status(409).json({ message: DUPLICATE_NAME });
     }
     const driver = new Driver({
       name,
       phone,
-      upiId: cleanUpiId(upiId),
       userId: req.user.id
     });
     await driver.save();
@@ -67,7 +53,7 @@ router.post('/', auth, async (req, res) => {
 // Update driver
 router.put('/:id', auth, async (req, res) => {
   try {
-    const { name, phone, upiId } = req.body;
+    const { name, phone } = req.body;
     const previous = await Driver.findOne({ _id: req.params.id, userId: req.user.id });
     if (!previous) {
       return res.status(404).json({ message: 'Driver not found' });
@@ -78,7 +64,7 @@ router.put('/:id', auth, async (req, res) => {
 
     const driver = await Driver.findOneAndUpdate(
       { _id: req.params.id, userId: req.user.id },
-      withoutUndefined({ name, phone, upiId: cleanUpiId(upiId) }),
+      { name, phone },
       { new: true, runValidators: true }
     );
 
